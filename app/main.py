@@ -138,7 +138,7 @@ class TaskSolver:
             text = response.text.strip()
             
             # Check for markdown code blocks safely
-            marker = "```
+            marker = "```python"
             if marker in text:
                 # Regex to find content between ```python and ```
                 code_match = re.search(r'```python(.*?)```
