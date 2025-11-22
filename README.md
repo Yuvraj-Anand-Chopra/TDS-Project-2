@@ -86,7 +86,7 @@ POST /solve-quiz
 ```json
 {
   "email": "24f2002642@ds.study.iitm.ac.in",
-  "secret": "YuvrajChopra2024Secret",
+  "secret": "Secret",
   "url": "https://tds-llm-analysis.s-anand.net/demo"
 }
 ```
@@ -107,7 +107,7 @@ POST /solve-quiz
 Invoke-RestMethod -Uri "https://tds-project-2-yuvraj.onrender.com/solve-quiz" `
   -Method POST `
   -ContentType "application/json" `
-  -Body '{"email":"24f2002642@ds.study.iitm.ac.in","secret":"YuvrajChopra2024Secret","url":"https://tds-llm-analysis.s-anand.net/demo"}'
+  -Body '{"email":"24f2002642@ds.study.iitm.ac.in","secret":"Secret","url":"https://tds-llm-analysis.s-anand.net/demo"}'
 ```
 
 ### Using Browser
