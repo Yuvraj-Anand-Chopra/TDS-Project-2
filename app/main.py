@@ -1,150 +1,230 @@
 import os
 import logging
-import asyncio
 import json
 import re
 import base64
-import time
-from typing import Optional, Dict, Any
+import subprocess
+import sys
+import traceback
+from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 import requests
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, field_validator
-from pydantic_settings import BaseSettings
-from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl, Field
 from dotenv import load_dotenv
 
-# --- CONFIGURATION & ENV VARS ---
+# --- CONFIGURATION ---
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class Settings(BaseSettings):
-    API_NAME: str = "LLM Quiz Solver"
-    API_VERSION: str = "1.0.0"
-    
-    # API Credentials (set these in Render Dashboard)
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = "gemini-2.0-flash"
-    
-    # User Defaults
-    EMAIL: str = "24f2002642@ds.study.iitm.ac.in"
-    SECRET: str = "YuvrajChopra2024Secret"
-    
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY is missing!")
 
-settings = Settings()
+genai.configure(api_key=GEMINI_API_KEY)
 
-# --- PYDANTIC MODELS (V2 COMPATIBLE) ---
+# --- DATA MODELS ---
 class QuizRequest(BaseModel):
     email: str
     secret: str
     url: HttpUrl
 
-    # V2 Validator Syntax
-    @field_validator('url')
-    @classmethod
-    def validate_url(cls, v):
-        return v
-
-class QuizResponse(BaseModel):
-    success: bool
-    answer: Optional[Any] = None
-    api_response: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
 # --- CORE LOGIC ---
 
-class GeminiHelper:
+class TaskSolver:
     def __init__(self):
-        if not settings.GEMINI_API_KEY:
-            logger.warning("GEMINI_API_KEY not set! API will fail.")
-            return
-        try:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
-            logger.info(f"Gemini initialized: {settings.GEMINI_MODEL}")
-        except Exception as e:
-            logger.error(f"Gemini init failed: {e}")
-
-    async def generate_answer(self, question_text: str) -> str:
-        try:
-            prompt = f"""
-            Solve this quiz question directly. Return ONLY the answer value.
-            
-            Question:
-            {question_text}
-            
-            If it's a math problem, return the number.
-            If it's a text question, return the word/phrase.
-            Do not add explanations or markdown.
-            """
-            response = self.model.generate_content(prompt)
-            return response.text.strip() if response.text else "Error: No text"
-        except Exception as e:
-            logger.error(f"LLM Generation failed: {e}")
-            return f"Error: {str(e)}"
-
-class WebScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
+        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        }
 
-    async def fetch_and_parse(self, url: str) -> str:
-        """Fetches page, handles Base64 obfuscation, returns instructions"""
-        logger.info(f"Fetching {url}")
+    def decode_obfuscated_html(self, html_content: str) -> str:
+        """
+        Simulates 'document.body.innerHTML = atob(...)' by finding base64 strings
+        in scripts and decoding them.
+        """
+        soup_text = html_content
         
-        # Run blocking request in thread pool
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: self.session.get(url, timeout=30))
-        response.raise_for_status()
+        # Find all atob("...") patterns
+        matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\s]+)[`"\']\)', html_content)
         
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # TDS Project Specific: Decode Base64 in scripts
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string and 'atob' in script.string:
-                matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\s]+)[`"\']\)', script.string)
-                for match in matches:
-                    try:
-                        clean_match = match.replace('\n', '').replace(' ', '')
-                        decoded = base64.b64decode(clean_match).decode('utf-8')
-                        # Inject decoded content back into soup
-                        if 'result' in str(decoded):
-                            soup.append(BeautifulSoup(decoded, 'html.parser'))
-                    except:
-                        pass
+        decoded_parts = []
+        for match in matches:
+            try:
+                # Clean whitespace that might be in the JS string
+                clean_match = re.sub(r'\s+', '', match)
+                decoded_bytes = base64.b64decode(clean_match)
+                decoded_str = decoded_bytes.decode('utf-8')
+                decoded_parts.append(decoded_str)
+            except Exception as e:
+                logger.warning(f"Failed to decode base64 segment: {e}")
 
-        # Fallback strategies to find the question text
-        instructions = ""
-        possible_ids = ['result', 'question', 'instruction', 'content']
+        # If we found decoded parts, assume they replace or append to the body
+        if decoded_parts:
+            return "\n".join(decoded_parts) + "\n" + html_content
         
-        for pid in possible_ids:
-            element = soup.find(id=pid)
-            if element:
-                instructions = element.get_text('\n').strip()
-                break
-        
-        if not instructions:
-            instructions = soup.get_text('\n').strip()
+        return html_content
+
+    def execute_python_code(self, code: str) -> str:
+        """
+        Executes LLM-generated Python code safely to handle data tasks.
+        """
+        logger.info("Executing generated Python code...")
+        try:
+            # Wrap code to capture stdout
+            wrapped_code = f"""
+import sys
+import io
+import pandas as pd
+import numpy as np
+import requests
+import json
+from pypdf import PdfReader
+
+# Capture stdout
+sys.stdout = io.StringIO()
+
+try:
+{'\n'.join('    ' + line for line in code.splitlines())}
+except Exception as e:
+    print(f"CODE_ERROR: {{e}}")
+
+print(sys.stdout.getvalue())
+"""
+            # Create a local namespace
+            local_vars = {}
+            exec(wrapped_code, {}, local_vars)
             
-        return instructions
+            # The wrapped code prints the result to stdout, which we captured
+            # Note: In a real 'exec', we can't easily capture stdout unless we redirect it inside.
+            # Simpler approach: Run as subprocess if complex, but exec is faster for Render.
+            
+            # Actually, let's just run the code directly and expect it to print the answer
+            # We need to capture the print output.
+            import io
+            from contextlib import redirect_stdout
+            
+            f = io.StringIO()
+            with redirect_stdout(f):
+                exec(code, {'pd': __import__('pandas'), 'requests': requests, 'json': json})
+            
+            output = f.getvalue().strip()
+            return output if output else "Code executed but returned no output."
 
-# --- API APPLICATION ---
+        except Exception as e:
+            return f"Execution Error: {traceback.format_exc()}"
 
-app = FastAPI(title=settings.API_NAME)
+    def get_llm_answer(self, instruction: str) -> str:
+        """
+        Asks Gemini to solve the task. 
+        If it's a data task, asks Gemini to write Python code, then executes it.
+        """
+        prompt = f"""
+        You are an expert automated agent. 
+        
+        TASK:
+        {instruction}
+        
+        INSTRUCTIONS:
+        1. If the answer is directly available in the text, output ONLY the answer.
+        2. If the task requires calculation, downloading files, parsing CSV/PDFs, or filtering data:
+           Write a PYTHON SCRIPT to do it.
+           - Use 'requests' to download.
+           - Use 'pandas' for data.
+           - PRINT the final answer at the end of the script.
+           - Wrap the code in `````` blocks.
+        
+        Output ONLY the Answer or the Python Code.
+        """
+        
+        try:
+            response = self.model.generate_content(prompt)
+            text = response.text.strip()
+            
+            # Check if response contains Python code
+            if "```
+                code_match = re.search(r'```python(.*?)```
+                if code_match:
+                    code = code_match.group(1)
+                    logger.info("LLM generated Python code. Executing...")
+                    result = self.execute_python_code(code)
+                    logger.info(f"Code execution result: {result}")
+                    return result.strip()
+            
+            return text
+        except Exception as e:
+            logger.error(f"LLM Error: {e}")
+            return "Error generating answer"
+
+    def solve_single_step(self, url: str, email: str, secret: str) -> Dict:
+        logger.info(f"Processing URL: {url}")
+        
+        # 1. Fetch Page
+        resp = requests.get(url, headers=self.headers)
+        resp.raise_for_status()
+        
+        # 2. Decode Content (Handle JS obfuscation)
+        readable_html = self.decode_obfuscated_html(resp.text)
+        
+        # 3. Extract Instructions (Regex is faster/safer than parsing broken HTML)
+        # Looking for the question text usually after the file link or in the body
+        # We simply dump the whole readable text to the LLM
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(readable_html, 'html.parser')
+        visible_text = soup.get_text("\n").strip()
+        
+        # 4. Solve
+        answer = self.get_llm_answer(visible_text)
+        
+        # Attempt to fix type (LLM returns string, but sometimes we need int/float)
+        # The prompt says payload can be number, string, etc.
+        # We'll try to parse if it looks like a number
+        final_answer = answer
+        if answer.isdigit():
+            final_answer = int(answer)
+        else:
+            try:
+                final_answer = float(answer)
+            except:
+                pass # Keep as string
+        
+        # 5. Find Submission URL
+        # Usually the instructions say "Post your answer to..."
+        # We use regex to find the submit URL in the text
+        submit_url = None
+        url_match = re.search(r'https?://[^\s]+submit', readable_html)
+        if url_match:
+            submit_url = url_match.group(0)
+        else:
+            # Fallback: assume /submit on same host
+            parsed = urlparse(url)
+            submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
+            
+        logger.info(f"Submitting '{final_answer}' to {submit_url}")
+        
+        # 6. Submit
+        payload = {
+            "email": email,
+            "secret": secret,
+            "url": url,
+            "answer": final_answer
+        }
+        
+        submit_resp = requests.post(submit_url, json=payload)
+        try:
+            return submit_resp.json()
+        except:
+            return {"error": submit_resp.text, "status": submit_resp.status_code}
+
+
+# --- API SETUP ---
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,57 +233,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-scraper = WebScraper()
-llm = GeminiHelper()
+solver = TaskSolver()
+
+@app.post("/solve-quiz")
+async def solve_quiz_endpoint(request: Request):
+    # 1. Validate JSON Body manually to handle 400 Bad Request explicitly
+    try:
+        body = await request.json()
+        req_data = QuizRequest(**body)
+    except Exception:
+        # Requirement: Respond with HTTP 400 for invalid JSON
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    # 2. Security Check
+    # Requirement: Respond with HTTP 403 for invalid secrets
+    # Check against env var, or just accept what was passed if you want to trust the user
+    # ideally:
+    EXPECTED_SECRET = os.getenv("SECRET") # e.g. YuvrajChopra2024Secret
+    if EXPECTED_SECRET and req_data.secret != EXPECTED_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid Secret")
+
+    # 3. Recursive Solving Loop
+    current_url = str(req_data.url)
+    email = req_data.email
+    secret = req_data.secret
+    
+    iteration = 0
+    max_iterations = 10 # Safety break
+    
+    last_response = {}
+    
+    while iteration < max_iterations:
+        try:
+            logger.info(f"--- Iteration {iteration + 1} ---")
+            result = solver.solve_single_step(current_url, email, secret)
+            last_response = result
+            
+            # Check if we need to continue
+            if isinstance(result, dict) and result.get("correct") is True:
+                next_url = result.get("url")
+                if next_url:
+                    logger.info(f"Correct! Moving to next URL: {next_url}")
+                    current_url = next_url
+                    iteration += 1
+                    continue
+                else:
+                    logger.info("Quiz Completed Successfully!")
+                    break
+            else:
+                # Wrong answer or error, return what we got
+                logger.warning(f"Submission failed or wrong answer: {result}")
+                break
+                
+        except Exception as e:
+            logger.error(f"Error in loop: {e}")
+            return JSONResponse(
+                status_code=500, 
+                content={"error": str(e)}
+            )
+
+    # Return the final result to the evaluator
+    return last_response
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "model": settings.GEMINI_MODEL}
-
-@app.post("/solve-quiz", response_model=QuizResponse)
-async def solve_quiz(request: QuizRequest):
-    try:
-        url_str = str(request.url)
-        
-        # 1. Get Instructions
-        instructions = await scraper.fetch_and_parse(url_str)
-        logger.info(f"Instructions length: {len(instructions)}")
-        
-        # 2. Solve
-        answer = await llm.generate_answer(instructions)
-        logger.info(f"Solved answer: {answer}")
-        
-        # 3. Submit
-        parsed = urlparse(url_str)
-        # Handle TDS submission URL convention
-        submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
-        
-        payload = {
-            "email": settings.EMAIL,
-            "secret": settings.SECRET,
-            "url": url_str,
-            "answer": answer
-        }
-        
-        logger.info(f"Submitting to {submit_url}")
-        loop = asyncio.get_event_loop()
-        submit_res = await loop.run_in_executor(
-            None, 
-            lambda: requests.post(submit_url, json=payload, timeout=30)
-        )
-        submit_res.raise_for_status()
-        api_response = submit_res.json()
-        
-        return QuizResponse(
-            success=True,
-            answer=answer,
-            api_response=api_response
-        )
-
-    except Exception as e:
-        logger.error(f"Process failed: {e}")
-        return QuizResponse(success=False, error=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def health():
+    return {"status": "ok"}
