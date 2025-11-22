@@ -3,18 +3,19 @@ import logging
 import json
 import re
 import base64
-import subprocess
 import sys
 import traceback
+import io
+from contextlib import redirect_stdout
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
 import requests
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
@@ -49,27 +50,28 @@ class TaskSolver:
         Simulates 'document.body.innerHTML = atob(...)' by finding base64 strings
         in scripts and decoding them.
         """
-        soup_text = html_content
-        
-        # Find all atob("...") patterns
-        matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\s]+)[`"\']\)', html_content)
-        
-        decoded_parts = []
-        for match in matches:
-            try:
-                # Clean whitespace that might be in the JS string
-                clean_match = re.sub(r'\s+', '', match)
-                decoded_bytes = base64.b64decode(clean_match)
-                decoded_str = decoded_bytes.decode('utf-8')
-                decoded_parts.append(decoded_str)
-            except Exception as e:
-                logger.warning(f"Failed to decode base64 segment: {e}")
+        try:
+            # Find all atob("...") patterns
+            matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\s]+)[`"\']\)', html_content)
+            
+            decoded_parts = []
+            for match in matches:
+                try:
+                    # Clean whitespace that might be in the JS string
+                    clean_match = re.sub(r'\s+', '', match)
+                    decoded_bytes = base64.b64decode(clean_match)
+                    decoded_str = decoded_bytes.decode('utf-8')
+                    decoded_parts.append(decoded_str)
+                except Exception as e:
+                    logger.warning(f"Failed to decode base64 segment: {e}")
 
-        # If we found decoded parts, assume they replace or append to the body
-        if decoded_parts:
-            return "\n".join(decoded_parts) + "\n" + html_content
-        
-        return html_content
+            # If we found decoded parts, assume they replace or append to the body
+            if decoded_parts:
+                return "\n".join(decoded_parts) + "\n" + html_content
+            
+            return html_content
+        except Exception:
+            return html_content
 
     def execute_python_code(self, code: str) -> str:
         """
@@ -77,47 +79,35 @@ class TaskSolver:
         """
         logger.info("Executing generated Python code...")
         try:
-            # Wrap code to capture stdout
-            wrapped_code = f"""
-import sys
-import io
-import pandas as pd
-import numpy as np
-import requests
-import json
-from pypdf import PdfReader
-
-# Capture stdout
-sys.stdout = io.StringIO()
-
-try:
-{'\n'.join('    ' + line for line in code.splitlines())}
-except Exception as e:
-    print(f"CODE_ERROR: {{e}}")
-
-print(sys.stdout.getvalue())
-"""
-            # Create a local namespace
-            local_vars = {}
-            exec(wrapped_code, {}, local_vars)
-            
-            # The wrapped code prints the result to stdout, which we captured
-            # Note: In a real 'exec', we can't easily capture stdout unless we redirect it inside.
-            # Simpler approach: Run as subprocess if complex, but exec is faster for Render.
-            
-            # Actually, let's just run the code directly and expect it to print the answer
-            # We need to capture the print output.
-            import io
-            from contextlib import redirect_stdout
-            
+            # Create a string buffer to capture stdout
             f = io.StringIO()
+            
+            # Define safe globals - imports that the code might need
+            # We import them here so the exec environment has access to them
+            import pandas as pd
+            import numpy as np
+            import requests
+            import json
+            import pypdf
+            
+            local_vars = {}
+            global_vars = {
+                "pd": pd,
+                "numpy": np,
+                "np": np,
+                "requests": requests,
+                "json": json,
+                "pypdf": pypdf,
+                "print": print
+            }
+
             with redirect_stdout(f):
-                exec(code, {'pd': __import__('pandas'), 'requests': requests, 'json': json})
+                exec(code, global_vars, local_vars)
             
             output = f.getvalue().strip()
             return output if output else "Code executed but returned no output."
 
-        except Exception as e:
+        except Exception:
             return f"Execution Error: {traceback.format_exc()}"
 
     def get_llm_answer(self, instruction: str) -> str:
@@ -138,7 +128,7 @@ print(sys.stdout.getvalue())
            - Use 'requests' to download.
            - Use 'pandas' for data.
            - PRINT the final answer at the end of the script.
-           - Wrap the code in `````` blocks.
+           - Wrap the code in python markdown blocks (triple backticks).
         
         Output ONLY the Answer or the Python Code.
         """
@@ -147,8 +137,10 @@ print(sys.stdout.getvalue())
             response = self.model.generate_content(prompt)
             text = response.text.strip()
             
-            # Check if response contains Python code
-            if "```
+            # Check for markdown code blocks safely
+            marker = "```
+            if marker in text:
+                # Regex to find content between ```python and ```
                 code_match = re.search(r'```python(.*?)```
                 if code_match:
                     code = code_match.group(1)
@@ -172,9 +164,7 @@ print(sys.stdout.getvalue())
         # 2. Decode Content (Handle JS obfuscation)
         readable_html = self.decode_obfuscated_html(resp.text)
         
-        # 3. Extract Instructions (Regex is faster/safer than parsing broken HTML)
-        # Looking for the question text usually after the file link or in the body
-        # We simply dump the whole readable text to the LLM
+        # 3. Extract Instructions
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(readable_html, 'html.parser')
         visible_text = soup.get_text("\n").strip()
@@ -183,22 +173,24 @@ print(sys.stdout.getvalue())
         answer = self.get_llm_answer(visible_text)
         
         # Attempt to fix type (LLM returns string, but sometimes we need int/float)
-        # The prompt says payload can be number, string, etc.
-        # We'll try to parse if it looks like a number
         final_answer = answer
-        if answer.isdigit():
-            final_answer = int(answer)
-        else:
-            try:
-                final_answer = float(answer)
-            except:
-                pass # Keep as string
+        # Heuristic: if it looks like a number, convert it
+        if str(answer).replace('.', '', 1).isdigit():
+            if '.' in str(answer):
+                try:
+                    final_answer = float(answer)
+                except:
+                    pass
+            else:
+                try:
+                    final_answer = int(answer)
+                except:
+                    pass
         
         # 5. Find Submission URL
-        # Usually the instructions say "Post your answer to..."
-        # We use regex to find the submit URL in the text
         submit_url = None
-        url_match = re.search(r'https?://[^\s]+submit', readable_html)
+        # Try to find specific submit link in text
+        url_match = re.search(r'https?://[^\s"\']+/submit', readable_html)
         if url_match:
             submit_url = url_match.group(0)
         else:
@@ -247,9 +239,7 @@ async def solve_quiz_endpoint(request: Request):
 
     # 2. Security Check
     # Requirement: Respond with HTTP 403 for invalid secrets
-    # Check against env var, or just accept what was passed if you want to trust the user
-    # ideally:
-    EXPECTED_SECRET = os.getenv("SECRET") # e.g. YuvrajChopra2024Secret
+    EXPECTED_SECRET = os.getenv("SECRET")
     if EXPECTED_SECRET and req_data.secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
 
@@ -270,6 +260,7 @@ async def solve_quiz_endpoint(request: Request):
             last_response = result
             
             # Check if we need to continue
+            # The API returns {"correct": true, "url": "..."} if there is another step
             if isinstance(result, dict) and result.get("correct") is True:
                 next_url = result.get("url")
                 if next_url:
@@ -297,4 +288,4 @@ async def solve_quiz_endpoint(request: Request):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "model": "gemini-2.0-flash"}
