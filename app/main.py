@@ -133,10 +133,10 @@ class TaskSolver:
             text = response.text.strip()
             
             # Check for markdown code blocks - use proper string
-            code_marker = "```
+            code_marker = "```python"
             if code_marker in text:
                 # Regex to find content between ```python and ```
-                code_match = re.search(r'```python(.*?)```
+                code_match = re.search(r'```python(.*?)```', text, re.DOTALL)
                 if code_match:
                     code = code_match.group(1)
                     logger.info("LLM generated Python code. Executing...")
