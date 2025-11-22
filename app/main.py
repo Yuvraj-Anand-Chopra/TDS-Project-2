@@ -111,48 +111,47 @@ class TaskSolver:
             return f"Execution Error: {traceback.format_exc()}"
 
     def get_llm_answer(self, instruction: str) -> str:
-        """
-        Asks Gemini to solve the task. 
-        If it's a data task, asks Gemini to write Python code, then executes it.
-        """
-        prompt = f"""
-        You are an expert automated agent. 
+    """
+    Asks Gemini to solve the task. 
+    If it's a data task, asks Gemini to write Python code, then executes it.
+    """
+    prompt = f"""
+    You are an expert automated agent. 
+    
+    TASK:
+    {instruction}
+    
+    INSTRUCTIONS:
+    1. If the answer is directly available in the text, output ONLY the answer.
+    2. If the task requires calculation, downloading files, parsing CSV/PDFs, or filtering data:
+       Write a PYTHON SCRIPT to do it.
+       - Use 'requests' to download.
+       - Use 'pandas' for data.
+       - PRINT the final answer at the end of the script.
+       - Wrap the code in python markdown blocks (triple backticks).
+    
+    Output ONLY the Answer or the Python Code.
+    """
+    
+    try:
+        response = self.model.generate_content(prompt)
+        text = response.text.strip()
         
-        TASK:
-        {instruction}
+        # Check for markdown code blocks safely
+        if "```
+            # Regex to find content between ```python and ```
+            code_match = re.search(r'```python(.*?)```
+            if code_match:
+                code = code_match.group(1)
+                logger.info("LLM generated Python code. Executing...")
+                result = self.execute_python_code(code)
+                logger.info(f"Code execution result: {result}")
+                return result.strip()
         
-        INSTRUCTIONS:
-        1. If the answer is directly available in the text, output ONLY the answer.
-        2. If the task requires calculation, downloading files, parsing CSV/PDFs, or filtering data:
-           Write a PYTHON SCRIPT to do it.
-           - Use 'requests' to download.
-           - Use 'pandas' for data.
-           - PRINT the final answer at the end of the script.
-           - Wrap the code in python markdown blocks (triple backticks).
-        
-        Output ONLY the Answer or the Python Code.
-        """
-        
-        try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            
-            # Check for markdown code blocks safely
-            marker = "```python"
-            if marker in text:
-                # Regex to find content between ```python and ```
-                code_match = re.search(r'```python(.*?)```
-                if code_match:
-                    code = code_match.group(1)
-                    logger.info("LLM generated Python code. Executing...")
-                    result = self.execute_python_code(code)
-                    logger.info(f"Code execution result: {result}")
-                    return result.strip()
-            
-            return text
-        except Exception as e:
-            logger.error(f"LLM Error: {e}")
-            return "Error generating answer"
+        return text
+    except Exception as e:
+        logger.error(f"LLM Error: {e}")
+        return "Error generating answer"
 
     def solve_single_step(self, url: str, email: str, secret: str) -> Dict:
         logger.info(f"Processing URL: {url}")
