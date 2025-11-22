@@ -51,7 +51,7 @@ pip install -r requirements.txt
 Create a `.env` file in the root directory:
 ```
 EMAIL=24f2002642@ds.study.iitm.ac.in
-SECRET=YuvrajChopra2024Secret
+SECRET=Secret
 GEMINI_API_KEY=your-gemini-api-key-here
 ```
 
