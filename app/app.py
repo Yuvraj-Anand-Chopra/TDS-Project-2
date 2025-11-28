@@ -1,7 +1,7 @@
 """
 CONSOLIDATED MAIN.PY - Single File Execution
 All logic from agent.py, tools.py, and main.py merged into one file.
-Execution: python main.py or uv run main.py
+Execution: python app.py or uv run app.py
 """
 
 # ============================================================================
@@ -102,10 +102,11 @@ def download_file(url: str, filename: str = None) -> str:
         return f"Error downloading file: {str(e)}"
 
 @tool
-def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Any:
+def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
     """
     Send an HTTP POST request to submit an answer.
     Always use this to submit answers to the /submit endpoint.
+    Returns the response as a JSON string.
     """
     headers = headers or {"Content-Type": "application/json"}
     try:
@@ -126,7 +127,8 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
             data = {"url": data.get("url")}
         
         print(f"Got the response:\n{json.dumps(data, indent=4)}\n")
-        return data
+        # ✅ CRITICAL FIX: Convert dictionary to JSON string
+        return json.dumps(data)
         
     except requests.HTTPError as e:
         err_resp = e.response
@@ -135,10 +137,12 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         except ValueError:
             err_data = err_resp.text
         logger.error(f"HTTP Error Response: {err_data}")
-        return err_data
+        # ✅ Return as string
+        return json.dumps({"error": str(err_data)})
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        return str(e)
+        # ✅ Return as string
+        return json.dumps({"error": str(e)})
 
 @tool
 def run_code(code: str) -> str:
