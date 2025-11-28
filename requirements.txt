@@ -13,7 +13,9 @@ pypdf==3.17.1
 openpyxl==3.1.2
 pillow==10.1.0
 playwright==1.40.0
-langgraph==0.0.69
-langchain==0.1.10
-langchain-core==0.1.42
-langchain-google-genai==0.0.11
+
+# === Modern, Fully Compatible LangChain Stack ===
+langchain==0.2.5
+langchain-core==0.2.9
+langgraph==0.2.6
+langchain-google-genai==1.0.5
