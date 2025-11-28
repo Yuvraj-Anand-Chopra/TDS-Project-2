@@ -1,7 +1,7 @@
 """
 AUTONOMOUS QUIZ SOLVER - Production Ready
 Compatible with langchain-google-genai 1.0.5
-Model: gemini-1.5-pro (stable and supported)
+Model: gemini-pro (stable and universally supported)
 """
 
 import os
@@ -82,6 +82,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 RECURSION_LIMIT = 5000
 MAX_TOKENS = 60000
+MAX_MESSAGES = 100  # Simple message count limit
 RETRY_LIMIT = 4
 
 # ============================================================================
@@ -367,9 +368,9 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=5,
 )
 
-# Initialize LLM with gemini-1.5-pro (STABLE & SUPPORTED)
+# Initialize LLM with gemini-pro (STABLE & UNIVERSALLY SUPPORTED)
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-pro",
+    model="gemini-pro",
     google_api_key=GOOGLE_API_KEY,
     rate_limiter=rate_limiter,
     safety_settings=safety_settings,
@@ -435,26 +436,34 @@ def agent_node(state: AgentState):
             result = llm.invoke(state["messages"] + [fail_msg])
             return {"messages": [result]}
 
-    # Context trimming
-    trimmed_messages = trim_messages(
-        messages=state["messages"],
-        max_tokens=MAX_TOKENS,
-        strategy="last",
-        include_system=True,
-        start_on="human",
-        token_counter=llm,
-    )
+    # Simple context trimming by message count (avoid countTokens issue)
+    messages = state["messages"]
+    if len(messages) > MAX_MESSAGES:
+        print(f"Trimming context: {len(messages)} → {MAX_MESSAGES} messages")
+        # Keep system message (first) and recent messages
+        system_msg = messages[0] if messages[0].get("role") == "system" else None
+        recent_messages = messages[-MAX_MESSAGES:]
+        if system_msg and recent_messages[0] != system_msg:
+            messages = [system_msg] + recent_messages
+        else:
+            messages = recent_messages
+    else:
+        messages = state["messages"]
 
     # Ensure we have at least one human message
-    has_human = any(msg.type == "human" for msg in trimmed_messages)
+    has_human = any(
+        (isinstance(m, dict) and m.get("role") == "human") or 
+        (hasattr(m, "type") and m.type == "human")
+        for m in messages
+    )
     if not has_human:
-        print("WARNING: Context trimmed too far. Injecting reminder.")
+        print("WARNING: No human message. Injecting reminder.")
         current_url = os.getenv("url", "Unknown")
         reminder = HumanMessage(content=f"Continue processing URL: {current_url}")
-        trimmed_messages.append(reminder)
+        messages.append(reminder)
 
-    print(f"--- INVOKING AGENT (Context: {len(trimmed_messages)} items) ---")
-    result = llm.invoke(trimmed_messages)
+    print(f"--- INVOKING AGENT (Context: {len(messages)} messages) ---")
+    result = llm.invoke(messages)
     return {"messages": [result]}
 
 
