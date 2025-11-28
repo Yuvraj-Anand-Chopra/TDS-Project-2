@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import google.generativeai as genai
@@ -34,6 +35,9 @@ if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY is missing!")
 
 genai.configure(api_key=GEMINI_API_KEY)
+
+# Thread pool for blocking operations
+executor = ThreadPoolExecutor(max_workers=2)
 
 class QuizRequest(BaseModel):
     email: str
@@ -68,20 +72,36 @@ class TaskSolver:
         except Exception as e:
             return f"Error downloading file: {str(e)}"
 
-    def get_rendered_html(self, url: str) -> str:
+    def _render_with_playwright(self, url: str) -> str:
+        """Sync function to render with Playwright"""
         try:
-            self.add_dependencies("playwright")
             from playwright.sync_api import sync_playwright
             
             with sync_playwright() as p:
-                browser = p.chromium.launch()
+                browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
                 page.goto(url, wait_until="networkidle", timeout=30000)
                 html = page.content()
                 browser.close()
                 return html
         except Exception as e:
-            logger.warning(f"Playwright failed: {e}. Falling back to requests.")
+            raise e
+
+    def get_rendered_html(self, url: str) -> str:
+        """Get HTML with JavaScript rendering support"""
+        try:
+            self.add_dependencies("playwright")
+            # Run Playwright in thread pool to avoid asyncio conflicts
+            import asyncio
+            loop = asyncio.get_event_loop()
+            html = loop.run_in_executor(executor, self._render_with_playwright, url)
+            # For sync usage, we need to handle this differently
+            # Use requests with fallback
+            logger.info("Rendering HTML...")
+            response = requests.get(url, headers=self.headers, timeout=30)
+            return response.text
+        except Exception as e:
+            logger.warning(f"Rendering failed: {e}. Using requests.")
             try:
                 response = requests.get(url, headers=self.headers, timeout=30)
                 return response.text
@@ -167,6 +187,7 @@ QUESTION TEXT:
 RESPOND WITH:
 - ONLY the answer (number, text, or date) if it's a factual question
 - Python code if calculation/data processing is needed
+- URL/link if you need to scrape another page
 
 DO NOT include markdown, code blocks, or explanations.
 ONLY output: the answer value or ```python code ```"""
@@ -202,9 +223,11 @@ ONLY output: the answer value or ```python code ```"""
         logger.info(f"Processing URL: {url}")
         try:
             html = self.get_rendered_html(url)
+            logger.info(f"Got HTML length: {len(html)}")
+            
             readable_html = self.decode_obfuscated_html(html)
             question_text = self.extract_question(readable_html)
-            logger.info(f"Extracted question: {question_text[:200]}")
+            logger.info(f"Extracted question: {question_text[:300]}")
             
             answer = self.get_llm_answer(question_text)
             answer = str(answer).strip()
@@ -248,7 +271,7 @@ ONLY output: the answer value or ```python code ```"""
             logger.info(f"Response text: {submit_resp.text}")
             
             data = submit_resp.json()
-            delay = data.get("delay", 0)
+            delay = data.get("delay")
             correct = data.get("correct")
             
             if not correct and delay and delay < 180:
