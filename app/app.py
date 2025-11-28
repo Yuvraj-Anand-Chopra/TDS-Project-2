@@ -1,6 +1,10 @@
 """
-CONSOLIDATED AI AGENT - Production Ready
-Integrates: OCR, Audio, Web Scraping, Code Execution, and Smart Retry Logic.
+CONSOLIDATED AI AGENT - Production Ready (Self-Contained)
+Integrates:
+- LangGraph Agent with Context Trimming & Self-Correction
+- Advanced Tools: OCR, Audio, Web Scraping, Code Execution
+- Shared State Management (Base64 Store)
+- Robust Retry Logic & Background Tasks
 """
 
 import os
@@ -32,7 +36,7 @@ import uvicorn
 from langchain_core.tools import tool
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import trim_messages, HumanMessage
+from langchain_core.messages import trim_messages, HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langchain.chat_models import init_chat_model
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import ToolNode
@@ -62,12 +66,16 @@ SECRET = os.getenv("SECRET")
 EXPECTED_SECRET = os.getenv("SECRET")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# Shared State (In-Memory Database)
-BASE64_STORE = {}  # Stores large image data
-URL_TIME = {}      # Tracks when we last saw a URL
-CACHE = defaultdict(int) # Tracks retries per URL
-
+# Constants
+RECURSION_LIMIT = 100
+MAX_TOKENS = 60000
 RETRY_LIMIT = 4
+
+# Shared State (In-Memory Database)
+# Critical for passing data between tools without bloating LLM context
+BASE64_STORE = {}  
+URL_TIME = {}      
+CACHE = defaultdict(int) 
 
 # ============================================================================
 # TOOLS
@@ -247,6 +255,21 @@ def encode_image_to_base64(image_path: str) -> str:
         return f"Encoding Error: {e}"
 
 @tool
+def add_dependencies(package_name: str) -> str:
+    """
+    Install Python packages dynamically using pip.
+    """
+    try:
+        print(f"\nInstalling {package_name}...")
+        if package_name in ["hashlib", "math", "json", "os", "sys"]:
+            return "Already installed."
+            
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
+        return f"Successfully installed {package_name}"
+    except Exception as e:
+        return f"Installation failed: {e}"
+
+@tool
 def post_request(url: str, payload: Dict[str, Any]) -> Any:
     """
     Submit answer. Handles Base64 injection and Retry Logic.
@@ -274,6 +297,7 @@ def post_request(url: str, payload: Dict[str, Any]) -> Any:
         response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         data = response.json()
+        print(f"Response: {json.dumps(data)}")
         
         # 2. Friend's Retry Logic
         next_url = data.get("url")
@@ -311,6 +335,7 @@ ALL_TOOLS = [
     download_file, 
     run_code, 
     post_request, 
+    add_dependencies,
     transcribe_audio, 
     ocr_image_tool, 
     encode_image_to_base64
@@ -332,6 +357,7 @@ rate_limiter = InMemoryRateLimiter(
 )
 
 # Using gemini-1.5-flash as default, essentially "Standard"
+# gemini-2.5-flash does NOT exist in v1beta API causing 404s
 llm = init_chat_model(
     model_provider="google_genai",
     model="gemini-1.5-flash", 
@@ -360,11 +386,24 @@ Start by fetching the page."""
 class AgentState(TypedDict):
     messages: Annotated[List, add_messages]
 
+# Node: Handle Malformed JSON (Self-Correction)
+def handle_malformed_node(state: AgentState):
+    """Retrieves the agent if it produces invalid JSON tool calls."""
+    print("--- DETECTED MALFORMED JSON. RE-PROMPTING ---")
+    return {
+        "messages": [
+            {
+                "role": "user", 
+                "content": "SYSTEM ERROR: Your last tool call was Malformed (Invalid JSON). Please rewrite the code and try again."
+            }
+        ]
+    }
+
 def agent_node(state: AgentState):
     # Context Trimming
     trimmed = trim_messages(
         messages=state["messages"],
-        max_tokens=50000,
+        max_tokens=MAX_TOKENS,
         strategy="last",
         include_system=True,
         start_on="human",
@@ -373,24 +412,51 @@ def agent_node(state: AgentState):
     # Ensure system prompt is present
     if not any(isinstance(m, HumanMessage) for m in trimmed):
          trimmed = [HumanMessage(content=f"Resume solving: {os.getenv('url')}")] + trimmed
+    if not any(isinstance(m, SystemMessage) for m in trimmed):
+         trimmed = [SystemMessage(content=SYSTEM_PROMPT)] + trimmed
          
-    result = llm.invoke(trimmed)
-    return {"messages": [result]}
+    try:
+        result = llm.invoke(trimmed)
+        return {"messages": [result]}
+    except Exception as e:
+        # Catch the "int object has no attribute name" error here if it persists
+        print(f"LLM Invocation Error: {e}")
+        return {"messages": [HumanMessage(content="There was an internal error calling the model. Please retry the last step.")]}
 
 def route(state):
     last = state["messages"][-1]
+    
+    # Check for Malformed calls (Google API specific)
+    if "finish_reason" in last.response_metadata:
+         if last.response_metadata["finish_reason"] == "MALFORMED_FUNCTION_CALL":
+             return "handle_malformed"
+
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
     if "Tasks completed" in str(last.content):
         return END
     return "agent"
 
+# --- Graph Construction ---
 graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", ToolNode(ALL_TOOLS))
+graph.add_node("handle_malformed", handle_malformed_node)
+
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "agent")
-graph.add_conditional_edges("agent", route, {"tools": "tools", "agent": "agent", END: END})
+graph.add_edge("handle_malformed", "agent")
+
+graph.add_conditional_edges(
+    "agent",
+    route,
+    {
+        "tools": "tools",
+        "agent": "agent",
+        "handle_malformed": "handle_malformed",
+        END: END
+    }
+)
 agent_runner = graph.compile()
 
 # ============================================================================
@@ -406,7 +472,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-START_TIME = time.time()
+SERVER_START = time.time()
 
 async def background_task(url: str):
     print(f"Starting task: {url}")
@@ -422,9 +488,13 @@ async def background_task(url: str):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Start here: {url}"}
         ]},
-        config={"recursion_limit": 500}
+        config={"recursion_limit": RECURSION_LIMIT}
     )
     print("Task finished.")
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "uptime": int(time.time() - SERVER_START)}
 
 @app.post("/solve")
 async def solve(request: Request, background_tasks: BackgroundTasks):
