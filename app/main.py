@@ -71,20 +71,15 @@ class TaskSolver:
     def get_rendered_html(self, url: str) -> str:
         try:
             self.add_dependencies("playwright")
-            from playwright.async_api import async_playwright
-            import asyncio
+            from playwright.sync_api import sync_playwright
             
-            async def render():
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch()
-                    page = await browser.new_page()
-                    await page.goto(url, wait_until="networkidle")
-                    html = await page.content()
-                    await browser.close()
-                    return html
-            
-            html = asyncio.run(render())
-            return html
+            with sync_playwright() as p:
+                browser = p.chromium.launch()
+                page = browser.new_page()
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                html = page.content()
+                browser.close()
+                return html
         except Exception as e:
             logger.warning(f"Playwright failed: {e}. Falling back to requests.")
             try:
@@ -249,23 +244,23 @@ ONLY output: the answer value or ```python code ```"""
             logger.info(f"Payload: {json.dumps(payload, indent=2)}")
             
             submit_resp = requests.post(submit_url, json=payload, timeout=30)
+            logger.info(f"Response status: {submit_resp.status_code}")
+            logger.info(f"Response text: {submit_resp.text}")
             
-            try:
-                data = submit_resp.json()
-                delay = data.get("delay", 0)
-                correct = data.get("correct")
-                
-                if not correct and delay < 180:
-                    if "url" in data:
-                        del data["url"]
-                
-                if delay >= 180:
-                    data = {"url": data.get("url")}
-                
-                logger.info(f"Response: {json.dumps(data, indent=2)}")
-                return data
-            except:
-                return {"error": "Invalid response from server", "status": submit_resp.status_code, "text": submit_resp.text[:200]}
+            data = submit_resp.json()
+            delay = data.get("delay", 0)
+            correct = data.get("correct")
+            
+            if not correct and delay and delay < 180:
+                if "url" in data:
+                    del data["url"]
+            
+            if delay and delay >= 180:
+                data = {"url": data.get("url")}
+            
+            logger.info(f"Response: {json.dumps(data, indent=2)}")
+            return data
+            
         except Exception as e:
             logger.error(f"Error in solve_single_step: {e}")
             import traceback
