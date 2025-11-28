@@ -1,9 +1,3 @@
-"""
-CONSOLIDATED MAIN.PY - Single File Execution
-All logic from agent.py, tools.py, and main.py merged into one file.
-Execution: python app.py or uv run app.py
-"""
-
 # ============================================================================
 # IMPORTS - All dependencies at the top
 # ============================================================================
@@ -34,6 +28,9 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.chat_models import init_chat_model
 from langgraph.graph.message import add_messages
 
+# Google GenAI Types for Safety Settings
+from langchain_google_genai import HarmBlockThreshold, HarmCategory
+
 # Other
 import requests
 from bs4 import BeautifulSoup
@@ -49,7 +46,8 @@ load_dotenv()
 EMAIL = os.getenv("EMAIL")
 SECRET = os.getenv("SECRET")
 EXPECTED_SECRET = os.getenv("SECRET")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Ensure we check for both keys to be safe
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,7 +94,11 @@ def download_file(url: str, filename: str = None) -> str:
             logger.info(f"Downloaded and saved: {filepath}")
         
         logger.info(f"Downloaded from {url}, length: {len(response.text)}")
-        return response.text
+        
+        # FIX: Explicitly tell the LLM what to do next to prevent looping
+        return (f"File downloaded successfully to {filename if filename else 'memory'}. "
+                f"Content length: {len(response.text)}. "
+                "IMPORTANT: Do not download this again. Immediately use 'run_code' to read and analyze this file.")
     except Exception as e:
         logger.error(f"Error downloading {url}: {e}")
         return f"Error downloading file: {str(e)}"
@@ -127,7 +129,6 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
             data = {"url": data.get("url")}
         
         print(f"Got the response:\n{json.dumps(data, indent=4)}\n")
-        # ✅ CRITICAL FIX: Convert dictionary to JSON string
         return json.dumps(data)
         
     except requests.HTTPError as e:
@@ -137,11 +138,9 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         except ValueError:
             err_data = err_resp.text
         logger.error(f"HTTP Error Response: {err_data}")
-        # ✅ Return as string
         return json.dumps({"error": str(err_data)})
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        # ✅ Return as string
         return json.dumps({"error": str(e)})
 
 @tool
@@ -223,11 +222,20 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=9
 )
 
-# Initialize LLM with tool binding
+# FIX: Define Safety Settings to prevent "FinishReason: 10" (Recitation/Safety) errors
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+# Initialize LLM with tool binding and safety settings
 llm = init_chat_model(
     model_provider="google_genai",
     model="gemini-2.5-flash",
-    rate_limiter=rate_limiter
+    rate_limiter=rate_limiter,
+    safety_settings=safety_settings # Applying the fix here
 ).bind_tools(TOOLS)
 
 # System prompt - instructs the LLM how to solve the quiz
@@ -251,6 +259,11 @@ GENERAL RULES:
 - NEVER re-submit unless the server explicitly allows or it's within the 3-minute limit.
 - ALWAYS inspect the server response before deciding what to do next.
 - ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
+
+DATA HANDLING RULES (CRITICAL):
+- If you download a CSV or Data file, DO NOT download it again. 
+- Your IMMEDIATELY NEXT step must be to use 'run_code' to read that file (e.g., using pandas) and perform the required analysis.
+- Do not just look at the file size; you must process the content.
 
 TIME LIMIT RULES:
 - Each task has a hard 3-minute limit.
