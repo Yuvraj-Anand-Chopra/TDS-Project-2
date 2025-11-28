@@ -132,11 +132,11 @@ class TaskSolver:
             response = self.model.generate_content(prompt)
             text = response.text.strip()
             
-            # Check for markdown code blocks - use proper string
-            code_marker = "```
+            # Check for markdown code blocks
+            code_marker = "```python"
             if code_marker in text:
                 # Regex to find content between ```python and ```
-                code_match = re.search(r'```python(.*?)```
+                code_match = re.search(r'```python(.*?)```', text, re.DOTALL)
                 if code_match:
                     code = code_match.group(1)
                     logger.info("LLM generated Python code. Executing...")
@@ -193,7 +193,7 @@ class TaskSolver:
             parsed = urlparse(url)
             submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
         
-        # ✅ FIX: Extract just the path from the quiz URL for submission
+        # FIX: Extract just the path from the quiz URL for submission
         parsed_url = urlparse(url)
         url_path = parsed_url.path if parsed_url.path else "/demo"
             
@@ -204,7 +204,7 @@ class TaskSolver:
         payload = {
             "email": email,
             "secret": secret,
-            "url": url_path,  # ✅ FIXED: Use path only, not full URL
+            "url": url_path,
             "answer": final_answer
         }
         
@@ -249,7 +249,7 @@ async def solve_quiz_endpoint(request: Request):
     secret = req_data.secret
     
     iteration = 0
-    max_iterations = 10  # Safety break
+    max_iterations = 10
     
     last_response = {}
     
@@ -260,7 +260,6 @@ async def solve_quiz_endpoint(request: Request):
             last_response = result
             
             # Check if we need to continue
-            # The API returns {"correct": true, "url": "..."} if there is another step
             if isinstance(result, dict) and result.get("correct") is True:
                 next_url = result.get("url")
                 if next_url:
