@@ -1,11 +1,9 @@
 """
-AUTONOMOUS QUIZ SOLVER - Production Ready
-Features:
-- File System Management (LLMFiles)
-- Safe Code Execution with Context Trimming
-- Robust POST Requests with Retry Logic
-- Safety Settings for Gemini API
-- Background Task Processing
+AUTONOMOUS QUIZ SOLVER - Production Ready (Stable Version)
+- LangGraph 0.0.69 (stable)
+- LangChain 0.1.10 (compatible)
+- Safe tool output handling
+- No serialization errors
 """
 
 import os
@@ -16,12 +14,8 @@ import logging
 import subprocess
 import requests
 import io
-import hashlib
-import base64
 from typing import TypedDict, Annotated, List, Any, Dict, Optional
-from collections import defaultdict
 from contextlib import redirect_stdout
-from urllib.parse import urljoin
 
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -44,7 +38,7 @@ except ImportError:
     BeautifulSoup = None
 
 # ============================================================================
-# CONFIGURATION
+# SETUP
 # ============================================================================
 
 load_dotenv()
@@ -57,12 +51,7 @@ EXPECTED_SECRET = os.getenv("SECRET", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 RECURSION_LIMIT = 5000
-MAX_TOKENS = 60000
-RETRY_LIMIT = 4
-
-BASE64_STORE = {}
-URL_TIME = {}
-CACHE = defaultdict(int)
+MAX_TOKENS = 50000
 
 # ============================================================================
 # TOOLS
@@ -71,42 +60,27 @@ CACHE = defaultdict(int)
 
 @tool
 def get_rendered_html(url: str) -> str:
-    """
-    Fetch and return the HTML content from a URL.
-    Returns a JSON string.
-    """
-    print(f"\nFetching and rendering: {url}")
+    """Fetch and return HTML content from a URL."""
+    print(f"\nFetching: {url}")
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         content = response.text
 
         if len(content) > 300000:
-            print("Warning: HTML too large, truncating...")
-            content = content[:300000] + "... [TRUNCATED DUE TO SIZE]"
+            content = content[:300000] + "... [TRUNCATED]"
 
-        imgs = []
-        if BeautifulSoup:
-            try:
-                soup = BeautifulSoup(content, "html.parser")
-                imgs = [urljoin(url, img["src"]) for img in soup.find_all("img", src=True)]
-            except Exception:
-                pass
-
-        # FIX: Return JSON string
-        return json.dumps({"html": content, "images": imgs, "url": url})
+        return content[:100000] if len(content) > 100000 else content
     except Exception as e:
-        return json.dumps({"error": f"Error fetching page: {str(e)}"})
+        return f"Error: {str(e)}"
 
 
 @tool
 def download_file(url: str, filename: str) -> str:
-    """
-    Download a file from a URL and save it to the 'LLMFiles/' directory.
-    """
+    """Download a file and save it to LLMFiles/."""
     try:
-        print(f"\nDownloading file from: {url}")
+        print(f"\nDownloading: {url}")
         response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
 
@@ -118,22 +92,16 @@ def download_file(url: str, filename: str) -> str:
                 if chunk:
                     f.write(chunk)
 
-        print(f"Saved to {path}")
-        return f"File saved successfully at: {path}. Use this path for processing."
+        return f"Saved to {path}"
     except Exception as e:
-        return f"Error downloading file: {str(e)}"
+        return f"Error: {str(e)}"
 
 
 @tool
 def run_code(code: str) -> str:
-    """
-    Execute Python code.
-    Pre-imported: pandas, numpy, requests, hashlib, json, os, bs4, base64, re, math.
-    Returns a JSON string.
-    """
+    """Execute Python code safely."""
     try:
-        print(f"\nExecuting Code:\n{code[:200]}...")
-
+        print(f"\nExecuting code...")
         os.makedirs("LLMFiles", exist_ok=True)
 
         f_out = io.StringIO()
@@ -146,13 +114,15 @@ def run_code(code: str) -> str:
             "requests": requests,
             "json": json,
             "print": print,
-            "BeautifulSoup": BeautifulSoup,
             "os": os,
-            "hashlib": hashlib,
-            "base64": base64,
+            "hashlib": __import__("hashlib"),
+            "base64": __import__("base64"),
             "math": __import__("math"),
             "re": __import__("re"),
         }
+
+        if BeautifulSoup:
+            global_vars["BeautifulSoup"] = BeautifulSoup
 
         with redirect_stdout(f_out):
             try:
@@ -166,69 +136,35 @@ def run_code(code: str) -> str:
 
         stdout = f_out.getvalue().strip()
         stderr = f_err.getvalue().strip()
-
-        # FIX: Return JSON string
-        result = {
-            "stdout": stdout if len(stdout) < 10000 else stdout[:10000] + "...truncated",
-            "stderr": stderr,
-            "return_code": 0 if not stderr else 1,
-        }
-        return json.dumps(result)
+        output = stdout if not stderr else f"ERROR: {stderr}"
+        return output[:5000] if len(output) > 5000 else output
 
     except Exception as e:
-        return json.dumps({"stdout": "", "stderr": str(e), "return_code": -1})
+        return f"Execution failed: {str(e)}"
 
 
 @tool
-def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
-    """
-    Send an HTTP POST request to submit an answer.
-    Returns response as a JSON string.
-    """
-    headers = headers or {"Content-Type": "application/json"}
-
-    # Handle Base64 placeholder replacement
-    ans = payload.get("answer")
-    if isinstance(ans, str) and ans.startswith("BASE64_KEY:"):
-        key = ans.split(":", 1)[1]
-        if key in BASE64_STORE:
-            payload["answer"] = BASE64_STORE[key]
-            print("Swapped placeholder with actual Base64 data.")
-
+def post_request(url: str, payload: Dict[str, Any]) -> str:
+    """Send HTTP POST request and return response."""
     try:
-        log_payload = payload.copy()
-        if isinstance(log_payload.get("answer"), str) and len(log_payload["answer"]) > 100:
-            log_payload["answer"] = log_payload["answer"][:50] + "..."
-        print(f"\nSending Answer to {url}...\nPayload: {json.dumps(log_payload, indent=2)}")
-
+        print(f"\nSending to: {url}")
+        headers = {"Content-Type": "application/json"}
         response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
-
-        data = response.json()
-        print(f"Response: {json.dumps(data, indent=2)}")
-
-        # FIX: Return JSON string
-        return json.dumps(data)
-
+        return json.dumps(response.json())
     except Exception as e:
-        logger.error(f"POST Request Error: {e}")
         return json.dumps({"error": str(e)})
 
 
 @tool
 def add_dependencies(package_name: str) -> str:
-    """
-    Install Python packages dynamically using pip.
-    """
+    """Install Python packages."""
     try:
-        print(f"\nInstalling {package_name}...")
-        if package_name in ["hashlib", "math", "json", "os", "sys"]:
-            return "Already installed."
-
+        print(f"\nInstalling: {package_name}")
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
-        return f"Successfully installed {package_name}"
+        return f"Installed {package_name}"
     except Exception as e:
-        return f"Installation failed: {e}"
+        return f"Failed: {str(e)}"
 
 
 # ============================================================================
@@ -245,9 +181,9 @@ safety_settings = {
 }
 
 rate_limiter = InMemoryRateLimiter(
-    requests_per_second=15 / 60,
+    requests_per_second=9 / 60,
     check_every_n_seconds=1,
-    max_bucket_size=15,
+    max_bucket_size=9,
 )
 
 llm = init_chat_model(
@@ -257,24 +193,23 @@ llm = init_chat_model(
     safety_settings=safety_settings,
 ).bind_tools(ALL_TOOLS)
 
-SYSTEM_PROMPT = f"""You are an elite autonomous agent designed to solve web challenges.
+SYSTEM_PROMPT = f"""You are an autonomous agent solving web challenges.
 
-YOUR GOAL:
-1. Access the given URL.
-2. Analyze the page content (HTML, Text, Images).
-3. Solve the specific puzzle (Math, Scraping, Coding).
-4. Submit the answer to the provided endpoint.
-5. Repeat until you receive completion message.
+GOAL:
+1. Access the URL provided
+2. Analyze content (HTML, text, data)
+3. Solve the puzzle (math, scraping, coding)
+4. Submit answer
+5. Continue until completion
 
-CRITICAL RULES:
-- **Files**: All files are downloaded to 'LLMFiles/'. Always prepend 'LLMFiles/' when reading files in Python.
-- **Libraries**: pandas, numpy, hashlib, requests, bs4 are pre-installed.
-- **Submission**: Always use `post_request`.
-- **Identity**: 
-    - Email: {EMAIL}
-    - Secret: {SECRET}
+RULES:
+- Files downloaded to LLMFiles/ (use this path in Python)
+- Pre-installed: pandas, numpy, hashlib, requests, bs4
+- Always use post_request to submit
+- Email: {EMAIL}
+- Secret: {SECRET}
 
-Start by fetching the page content. Good luck."""
+Start by fetching the page."""
 
 
 class AgentState(TypedDict):
@@ -282,20 +217,19 @@ class AgentState(TypedDict):
 
 
 def agent_node(state: AgentState):
-    """Main agent node."""
-    print(f"--- INVOKING AGENT (Context: {len(state['messages'])} msgs) ---")
+    """Main agent."""
     result = llm.invoke(state["messages"])
     return {"messages": [result]}
 
 
 def route(state):
-    """Routing logic."""
+    """Route logic."""
     last = state["messages"][-1]
 
     if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
 
-    content = last.content if hasattr(last, "content") else ""
+    content = getattr(last, "content", "")
     if isinstance(content, str) and ("Tasks completed" in content or "END" in content):
         return END
 
@@ -305,15 +239,13 @@ def route(state):
 graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
 graph.add_node("tools", ToolNode(ALL_TOOLS))
-
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "agent")
 graph.add_conditional_edges("agent", route, {"tools": "tools", "agent": "agent", END: END})
-
 agent_runner = graph.compile()
 
 # ============================================================================
-# FASTAPI SERVER
+# FASTAPI
 # ============================================================================
 
 app = FastAPI()
@@ -325,95 +257,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SERVER_START_TIME = time.time()
+SERVER_START = time.time()
 
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "uptime": int(time.time() - SERVER_START_TIME), "model": "gemini-2.5-flash"}
+    return {"status": "ok", "uptime": int(time.time() - SERVER_START)}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "gemini-2.5-flash"}
+    return {"status": "ok"}
 
 
-async def background_solve(url: str):
-    """Background task to run the agent loop."""
+async def run_agent_task(url: str):
+    """Run agent in background."""
     try:
-        print(f"Starting background task for: {url}")
-        BASE64_STORE.clear()
-        URL_TIME.clear()
-        CACHE.clear()
-
+        print(f"Starting: {url}")
         initial_msg = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Start the challenge at: {url}"},
+            {"role": "user", "content": f"Start: {url}"},
         ]
-
-        agent_runner.invoke({"messages": initial_msg}, config={"recursion_limit": RECURSION_LIMIT})
-        print("Task Finished Successfully.")
+        agent_runner.invoke(
+            {"messages": initial_msg},
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+        print("Completed successfully")
     except Exception as e:
-        print(f"Task Failed: {e}")
+        print(f"Failed: {e}")
 
 
 @app.post("/solve-quiz")
-async def solve_quiz_endpoint(request: Request):
-    """Synchronous endpoint."""
+async def solve_quiz(request: Request):
+    """Solve quiz synchronously."""
     try:
         data = await request.json()
         url = data.get("url")
         secret = data.get("secret")
 
-        if not url or not secret:
-            raise HTTPException(status_code=400, detail="Missing url or secret")
+        if not url or secret != EXPECTED_SECRET:
+            raise HTTPException(status_code=400, detail="Invalid request")
 
-        if secret != EXPECTED_SECRET:
-            raise HTTPException(status_code=403, detail="Invalid secret")
-
-        result = {}
         try:
-            BASE64_STORE.clear()
-            URL_TIME.clear()
-            CACHE.clear()
-
             initial_msg = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Start the challenge at: {url}"},
+                {"role": "user", "content": f"Start: {url}"},
             ]
-
-            agent_runner.invoke({"messages": initial_msg}, config={"recursion_limit": RECURSION_LIMIT})
-            result = {"status": "completed", "message": "All quiz tasks solved successfully"}
+            agent_runner.invoke(
+                {"messages": initial_msg},
+                config={"recursion_limit": RECURSION_LIMIT},
+            )
+            return {"status": "completed"}
         except Exception as e:
-            result = {"status": "error", "message": str(e)}
+            return {"status": "error", "message": str(e)}
 
-        return result
-
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/solve")
-async def solve_endpoint(request: Request, background_tasks: BackgroundTasks):
-    """Asynchronous endpoint."""
+async def solve_async(request: Request, background_tasks: BackgroundTasks):
+    """Solve quiz asynchronously."""
     try:
         data = await request.json()
         url = data.get("url")
         secret = data.get("secret")
 
-        if not url or not secret:
-            raise HTTPException(status_code=400, detail="Missing url or secret")
+        if not url or secret != EXPECTED_SECRET:
+            raise HTTPException(status_code=400, detail="Invalid request")
 
-        if secret != EXPECTED_SECRET:
-            raise HTTPException(status_code=403, detail="Invalid secret")
+        background_tasks.add_task(run_agent_task, url)
+        return {"status": "ok"}
 
-        background_tasks.add_task(background_solve, url)
-
-        return JSONResponse(status_code=200, content={"status": "ok", "message": "Agent started"})
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
