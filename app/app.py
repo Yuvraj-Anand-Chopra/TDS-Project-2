@@ -1,7 +1,7 @@
 """
 AUTONOMOUS QUIZ SOLVER - Production Ready
 Compatible with langchain-google-genai 1.0.5
-Model: gemini-pro (stable and universally supported)
+Model: gemini-1.0-pro (v1beta API compatible)
 """
 
 import os
@@ -81,8 +81,7 @@ EXPECTED_SECRET = os.getenv("SECRET", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
 RECURSION_LIMIT = 5000
-MAX_TOKENS = 60000
-MAX_MESSAGES = 100  # Simple message count limit
+MAX_MESSAGES = 100
 RETRY_LIMIT = 4
 
 # ============================================================================
@@ -368,9 +367,9 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=5,
 )
 
-# Initialize LLM with gemini-pro (STABLE & UNIVERSALLY SUPPORTED)
+# Initialize LLM with gemini-1.0-pro (v1beta API compatible)
 llm = ChatGoogleGenerativeAI(
-    model="gemini-pro",
+    model="gemini-1.0-pro",
     google_api_key=GOOGLE_API_KEY,
     rate_limiter=rate_limiter,
     safety_settings=safety_settings,
@@ -436,12 +435,11 @@ def agent_node(state: AgentState):
             result = llm.invoke(state["messages"] + [fail_msg])
             return {"messages": [result]}
 
-    # Simple context trimming by message count (avoid countTokens issue)
+    # Simple context trimming by message count
     messages = state["messages"]
     if len(messages) > MAX_MESSAGES:
         print(f"Trimming context: {len(messages)} → {MAX_MESSAGES} messages")
-        # Keep system message (first) and recent messages
-        system_msg = messages[0] if messages[0].get("role") == "system" else None
+        system_msg = messages[0] if messages and messages[0].get("role") == "system" else None
         recent_messages = messages[-MAX_MESSAGES:]
         if system_msg and recent_messages[0] != system_msg:
             messages = [system_msg] + recent_messages
