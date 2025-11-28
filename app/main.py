@@ -1,13 +1,17 @@
 import os
 import logging
+import json
 import re
 import base64
 import io
 from contextlib import redirect_stdout
+from typing import Dict
 from urllib.parse import urlparse
+
 import requests
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
@@ -91,7 +95,7 @@ class TaskSolver:
             except: pass
             u = urlparse(url)
             sub = f"{u.scheme}://{u.netloc}/submit"
-            pl = {"email": email, "secret": secret, "url": u.path, "answer": final}
+            pl = {"email": email, "secret": secret, "url": url, "answer": final}
             return requests.post(sub, json=pl, timeout=30).json()
         except Exception as e:
             return {"error": str(e)}
