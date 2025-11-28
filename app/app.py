@@ -70,9 +70,10 @@ CACHE = defaultdict(int)
 
 
 @tool
-def get_rendered_html(url: str) -> dict:
+def get_rendered_html(url: str) -> str:
     """
     Fetch and return the HTML content from a URL.
+    Returns a JSON string.
     """
     print(f"\nFetching and rendering: {url}")
     try:
@@ -93,9 +94,10 @@ def get_rendered_html(url: str) -> dict:
             except Exception:
                 pass
 
-        return {"html": content, "images": imgs, "url": url}
+        # FIX: Return JSON string
+        return json.dumps({"html": content, "images": imgs, "url": url})
     except Exception as e:
-        return {"error": f"Error fetching page: {str(e)}"}
+        return json.dumps({"error": f"Error fetching page: {str(e)}"})
 
 
 @tool
@@ -123,10 +125,11 @@ def download_file(url: str, filename: str) -> str:
 
 
 @tool
-def run_code(code: str) -> dict:
+def run_code(code: str) -> str:
     """
     Execute Python code.
     Pre-imported: pandas, numpy, requests, hashlib, json, os, bs4, base64, re, math.
+    Returns a JSON string.
     """
     try:
         print(f"\nExecuting Code:\n{code[:200]}...")
@@ -164,14 +167,16 @@ def run_code(code: str) -> dict:
         stdout = f_out.getvalue().strip()
         stderr = f_err.getvalue().strip()
 
-        return {
+        # FIX: Return JSON string
+        result = {
             "stdout": stdout if len(stdout) < 10000 else stdout[:10000] + "...truncated",
             "stderr": stderr,
             "return_code": 0 if not stderr else 1,
         }
+        return json.dumps(result)
 
     except Exception as e:
-        return {"stdout": "", "stderr": str(e), "return_code": -1}
+        return json.dumps({"stdout": "", "stderr": str(e), "return_code": -1})
 
 
 @tool
@@ -202,6 +207,7 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         data = response.json()
         print(f"Response: {json.dumps(data, indent=2)}")
 
+        # FIX: Return JSON string
         return json.dumps(data)
 
     except Exception as e:
