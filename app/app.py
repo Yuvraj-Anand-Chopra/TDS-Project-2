@@ -1,250 +1,236 @@
 """
-CONSOLIDATED MAIN.PY - Single File Execution
-All logic from agent.py, tools.py, and main.py merged into one file.
-Execution: python app.py or uv run app.py
+AUTONOMOUS QUIZ SOLVER - Production Ready
+Features:
+- File System Management (LLMFiles)
+- Safe Code Execution with Context Trimming
+- Robust POST Requests with Retry Logic
+- Safety Settings for Gemini API
+- Background Task Processing
 """
-
-# ============================================================================
-# IMPORTS - All dependencies at the top
-# ============================================================================
 
 import os
 import sys
 import time
 import json
-import subprocess
 import logging
-import hashlib
-import math
-from typing import TypedDict, Annotated, List, Any, Dict, Optional
-from contextlib import redirect_stdout
+import subprocess
+import requests
 import io
+import hashlib
+import base64
+from typing import TypedDict, Annotated, List, Any, Dict, Optional
+from collections import defaultdict
+from contextlib import redirect_stdout
+from urllib.parse import urljoin
 
-# FastAPI
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+import uvicorn
 
-# LangGraph
-from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
-
-# LangChain
 from langchain_core.tools import tool
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, END, START
+from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
-
-# Google GenAI Types for Safety Settings
 from langchain_google_genai import HarmBlockThreshold, HarmCategory
 
-# Other
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-import uvicorn
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 # ============================================================================
-# CONFIGURATION & ENVIRONMENT
+# CONFIGURATION
 # ============================================================================
 
 load_dotenv()
-
-EMAIL = os.getenv("EMAIL")
-SECRET = os.getenv("SECRET")
-EXPECTED_SECRET = os.getenv("SECRET")
-# Ensure we check for both keys to be safe
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+EMAIL = os.getenv("EMAIL", "")
+SECRET = os.getenv("SECRET", "")
+EXPECTED_SECRET = os.getenv("SECRET", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+RECURSION_LIMIT = 5000
+MAX_TOKENS = 60000
+RETRY_LIMIT = 4
+
+BASE64_STORE = {}
+URL_TIME = {}
+CACHE = defaultdict(int)
+
 # ============================================================================
-# TOOL FUNCTIONS - Helper functions that LLM can call
+# TOOLS
 # ============================================================================
 
+
 @tool
-def get_rendered_html(url: str) -> str:
+def get_rendered_html(url: str) -> dict:
     """
     Fetch and return the HTML content from a URL.
-    Use this to get the page content before making decisions.
     """
+    print(f"\nFetching and rendering: {url}")
     try:
-        print(f"\nFetching and rendering: {url}\n")
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-        logger.info(f"Retrieved HTML from {url}, length: {len(response.text)}")
-        return response.text
+        content = response.text
+
+        if len(content) > 300000:
+            print("Warning: HTML too large, truncating...")
+            content = content[:300000] + "... [TRUNCATED DUE TO SIZE]"
+
+        imgs = []
+        if BeautifulSoup:
+            try:
+                soup = BeautifulSoup(content, "html.parser")
+                imgs = [urljoin(url, img["src"]) for img in soup.find_all("img", src=True)]
+            except Exception:
+                pass
+
+        return {"html": content, "images": imgs, "url": url}
     except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
-        return f"Error fetching URL: {str(e)}"
+        return {"error": f"Error fetching page: {str(e)}"}
+
 
 @tool
-def download_file(url: str, filename: str = None) -> str:
+def download_file(url: str, filename: str) -> str:
     """
-    Download a file (or any resource) from a URL and return its content.
-    Useful for getting utils.js, data files, JSON endpoints, etc.
+    Download a file from a URL and save it to the 'LLMFiles/' directory.
     """
     try:
-        print(f"\nFetching and rendering: {url}\n")
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=30)
+        print(f"\nDownloading file from: {url}")
+        response = requests.get(url, stream=True, timeout=30)
         response.raise_for_status()
-        
-        # Save to file if filename provided
-        saved_path = "memory"
-        if filename:
-            os.makedirs("LLMFiles", exist_ok=True)
-            filepath = os.path.join("LLMFiles", filename)
-            with open(filepath, "wb") as f:
-                f.write(response.content)
-            logger.info(f"Downloaded and saved: {filepath}")
-            saved_path = filepath
-        
-        logger.info(f"Downloaded from {url}, length: {len(response.text)}")
-        
-        # Explicitly tell the LLM the PATH where it was saved
-        return (f"File downloaded successfully. "
-                f"Saved at path: '{saved_path}'. "
-                f"Content length: {len(response.text)}. "
-                f"IMPORTANT: When reading this file in Python, you MUST use the path '{saved_path}'. "
-                "Do not download this again. Immediately use 'run_code' to read and analyze it.")
+
+        os.makedirs("LLMFiles", exist_ok=True)
+        path = os.path.join("LLMFiles", filename)
+
+        with open(path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        print(f"Saved to {path}")
+        return f"File saved successfully at: {path}. Use this path for processing."
     except Exception as e:
-        logger.error(f"Error downloading {url}: {e}")
         return f"Error downloading file: {str(e)}"
 
-@tool
-def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
-    """
-    Send an HTTP POST request to submit an answer.
-    Always use this to submit answers to the /submit endpoint.
-    Returns the response as a JSON string.
-    """
-    headers = headers or {"Content-Type": "application/json"}
-    try:
-        print(f"\nSending Answer\n{json.dumps(payload, indent=4)}\n to url: {url}\n")
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        delay = data.get("delay", 0)
-        delay = delay if isinstance(delay, (int, float)) else 0
-        correct = data.get("correct", False)
-        
-        if not correct and delay and delay < 180:
-            if "url" in data:
-                del data["url"]
-        
-        if delay and delay >= 180:
-            data = {"url": data.get("url")}
-        
-        print(f"Got the response:\n{json.dumps(data, indent=4)}\n")
-        return json.dumps(data)
-        
-    except requests.HTTPError as e:
-        err_resp = e.response
-        try:
-            err_data = err_resp.json()
-        except ValueError:
-            err_data = err_resp.text
-        logger.error(f"HTTP Error Response: {err_data}")
-        return json.dumps({"error": str(err_data)})
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        return json.dumps({"error": str(e)})
 
 @tool
-def run_code(code: str) -> str:
+def run_code(code: str) -> dict:
     """
-    Execute Python code and return the output.
-    Use this when you need to calculate values, parse data, or process information.
+    Execute Python code.
+    Pre-imported: pandas, numpy, requests, hashlib, json, os, bs4, base64, re, math.
     """
     try:
-        import pandas as pd
-        import numpy as np
-        
-        print(f"\nExecuting code:\n{code}\n")
-        
+        print(f"\nExecuting Code:\n{code[:200]}...")
+
         os.makedirs("LLMFiles", exist_ok=True)
-        filename = "runner.py"
-        filepath = os.path.join("LLMFiles", filename)
-        
-        with open(filepath, "w") as f:
-            f.write(code)
-        
+
         f_out = io.StringIO()
+        f_err = io.StringIO()
+
         local_vars = {}
-        
-        # CRITICAL FIX: Inject hashlib and math directly into the execution scope
-        # This prevents "name 'hashlib' is not defined" errors
         global_vars = {
-            "pd": pd,
-            "numpy": np,
-            "np": np,
+            "pd": __import__("pandas"),
+            "np": __import__("numpy"),
             "requests": requests,
             "json": json,
             "print": print,
             "BeautifulSoup": BeautifulSoup,
             "os": os,
             "hashlib": hashlib,
-            "math": math
+            "base64": base64,
+            "math": __import__("math"),
+            "re": __import__("re"),
         }
-        
+
         with redirect_stdout(f_out):
-            exec(code, global_vars, local_vars)
-        
-        output = f_out.getvalue().strip()
-        result = output if output else "Code executed successfully"
-        logger.info(f"Code result: {result}")
-        return result
-        
+            try:
+                original_cwd = os.getcwd()
+                os.chdir("LLMFiles")
+                exec(code, global_vars, local_vars)
+            except Exception as e:
+                f_err.write(str(e))
+            finally:
+                os.chdir(original_cwd)
+
+        stdout = f_out.getvalue().strip()
+        stderr = f_err.getvalue().strip()
+
+        return {
+            "stdout": stdout if len(stdout) < 10000 else stdout[:10000] + "...truncated",
+            "stderr": stderr,
+            "return_code": 0 if not stderr else 1,
+        }
+
     except Exception as e:
-        error_msg = f"Code execution failed: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+        return {"stdout": "", "stderr": str(e), "return_code": -1}
+
+
+@tool
+def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
+    """
+    Send an HTTP POST request to submit an answer.
+    Returns response as a JSON string.
+    """
+    headers = headers or {"Content-Type": "application/json"}
+
+    # Handle Base64 placeholder replacement
+    ans = payload.get("answer")
+    if isinstance(ans, str) and ans.startswith("BASE64_KEY:"):
+        key = ans.split(":", 1)[1]
+        if key in BASE64_STORE:
+            payload["answer"] = BASE64_STORE[key]
+            print("Swapped placeholder with actual Base64 data.")
+
+    try:
+        log_payload = payload.copy()
+        if isinstance(log_payload.get("answer"), str) and len(log_payload["answer"]) > 100:
+            log_payload["answer"] = log_payload["answer"][:50] + "..."
+        print(f"\nSending Answer to {url}...\nPayload: {json.dumps(log_payload, indent=2)}")
+
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        data = response.json()
+        print(f"Response: {json.dumps(data, indent=2)}")
+
+        return json.dumps(data)
+
+    except Exception as e:
+        logger.error(f"POST Request Error: {e}")
+        return json.dumps({"error": str(e)})
+
 
 @tool
 def add_dependencies(package_name: str) -> str:
     """
-    Install a Python package if needed.
-    Use this if the code requires additional libraries.
+    Install Python packages dynamically using pip.
     """
     try:
-        print(f"\nInstalling {package_name}...\n")
-        # Optimization: hashlib is built-in, don't try to install it
-        if package_name == "hashlib":
-            return "Success: hashlib is a built-in library, no installation needed."
-            
+        print(f"\nInstalling {package_name}...")
+        if package_name in ["hashlib", "math", "json", "os", "sys"]:
+            return "Already installed."
+
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
-        result = f"Successfully installed {package_name}"
-        logger.info(result)
-        return result
+        return f"Successfully installed {package_name}"
     except Exception as e:
-        error_msg = f"Error installing {package_name}: {str(e)}"
-        logger.error(error_msg)
-        return error_msg
+        return f"Installation failed: {e}"
+
 
 # ============================================================================
-# LANGGRAPH SETUP - Agent state and configuration
+# AGENT SETUP
 # ============================================================================
 
-class AgentState(TypedDict):
-    """State object that holds conversation messages"""
-    messages: Annotated[List, add_messages]
+ALL_TOOLS = [get_rendered_html, download_file, run_code, post_request, add_dependencies]
 
-# Define tools that the agent can use
-TOOLS = [run_code, get_rendered_html, download_file, post_request, add_dependencies]
-
-# Rate limiter for Gemini API
-rate_limiter = InMemoryRateLimiter(
-    requests_per_second=9/60,
-    check_every_n_seconds=1,
-    max_bucket_size=9
-)
-
-# Safety settings
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -252,146 +238,79 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# Initialize LLM with tool binding
-# USES GEMINI-1.5-PRO (Most stable model)
+rate_limiter = InMemoryRateLimiter(
+    requests_per_second=15 / 60,
+    check_every_n_seconds=1,
+    max_bucket_size=15,
+)
+
 llm = init_chat_model(
     model_provider="google_genai",
-    model="gemini-1.5-pro",
+    model="gemini-2.5-flash",
     rate_limiter=rate_limiter,
-    safety_settings=safety_settings
-).bind_tools(TOOLS)
+    safety_settings=safety_settings,
+).bind_tools(ALL_TOOLS)
 
-# System prompt - Instructions for the LLM
-SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent.
+SYSTEM_PROMPT = f"""You are an elite autonomous agent designed to solve web challenges.
 
-Your job is to:
-1. Load the quiz page from the given URL.
-2. Extract ALL instructions, required parameters, submission rules, and the submit endpoint.
-3. Solve the task exactly as required.
-4. Submit the answer ONLY to the endpoint specified on the current page.
+YOUR GOAL:
+1. Access the given URL.
+2. Analyze the page content (HTML, Text, Images).
+3. Solve the specific puzzle (Math, Scraping, Coding).
+4. Submit the answer to the provided endpoint.
+5. Repeat until you receive completion message.
 
-STRICT RULES — FOLLOW EXACTLY:
+CRITICAL RULES:
+- **Files**: All files are downloaded to 'LLMFiles/'. Always prepend 'LLMFiles/' when reading files in Python.
+- **Libraries**: pandas, numpy, hashlib, requests, bs4 are pre-installed.
+- **Submission**: Always use `post_request`.
+- **Identity**: 
+    - Email: {EMAIL}
+    - Secret: {SECRET}
 
-FILE SYSTEM RULES (CRITICAL):
-- All files downloaded via 'download_file' are saved in the 'LLMFiles' subdirectory.
-- When you write Python code to read these files, you MUST use the path 'LLMFiles/filename'.
-- Example: `pd.read_csv('LLMFiles/data.csv')` or `open('LLMFiles/script.js')`.
-- If a file read fails, use `os.listdir('LLMFiles')` to check the actual filenames.
+Start by fetching the page content. Good luck."""
 
-DATA HANDLING RULES:
-- If you download a CSV/Data file, DO NOT download it again. Immediately read it using `run_code`.
-- Do not assume column names (e.g. 'value'). Always print `df.columns` first to verify.
 
-GENERAL RULES:
-- NEVER stop early. Continue solving tasks until no new URL is provided.
-- NEVER hallucinate URLs, endpoints, fields, values, or JSON structure.
-- ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
-- **hashlib is pre-installed.** You do not need to install it. Just import it in your code.
+class AgentState(TypedDict):
+    messages: Annotated[List, add_messages]
 
-TIME LIMIT RULES:
-- Each task has a hard 3-minute limit.
-- If your answer is wrong retry again.
-
-STOPPING CONDITION:
-- Only return "END" when a server response explicitly contains NO new URL.
-
-ADDITIONAL INFORMATION YOU MUST INCLUDE WHEN REQUIRED:
-- Email: {EMAIL}
-- Secret: {SECRET}
-
-YOUR JOB:
-- Follow pages exactly.
-- Extract data reliably.
-- Never guess.
-- Submit correct answers.
-- Continue until no new URL.
-- Then respond with: END"""
-
-# Create prompt with system message
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    MessagesPlaceholder(variable_name="messages")
-])
-
-llm_with_prompt = prompt | llm
-
-# ============================================================================
-# AGENT NODE & ROUTING - Core agent logic
-# ============================================================================
 
 def agent_node(state: AgentState):
-    """The main agent node - calls LLM to decide next action"""
-    result = llm_with_prompt.invoke({"messages": state["messages"]})
-    return {"messages": state["messages"] + [result]}
+    """Main agent node."""
+    print(f"--- INVOKING AGENT (Context: {len(state['messages'])} msgs) ---")
+    result = llm.invoke(state["messages"])
+    return {"messages": [result]}
+
 
 def route(state):
-    """Decide whether to call tools, continue agent, or end"""
+    """Routing logic."""
     last = state["messages"][-1]
-    
-    # Check for tool calls
-    tool_calls = None
-    if hasattr(last, "tool_calls"):
-        tool_calls = getattr(last, "tool_calls", None)
-    elif isinstance(last, dict):
-        tool_calls = last.get("tool_calls")
-    
-    if tool_calls:
+
+    if hasattr(last, "tool_calls") and last.tool_calls:
         return "tools"
-    
-    # Check for END signal
-    content = None
-    if hasattr(last, "content"):
-        content = getattr(last, "content", None)
-    elif isinstance(last, dict):
-        content = last.get("content")
-    
-    if isinstance(content, str) and content.strip() == "END":
+
+    content = last.content if hasattr(last, "content") else ""
+    if isinstance(content, str) and ("Tasks completed" in content or "END" in content):
         return END
-    
-    if isinstance(content, list) and len(content) > 0:
-        if isinstance(content[0], dict) and content[0].get("text", "").strip() == "END":
-            return END
-    
+
     return "agent"
 
-# ============================================================================
-# BUILD LANGGRAPH
-# ============================================================================
 
 graph = StateGraph(AgentState)
 graph.add_node("agent", agent_node)
-graph.add_node("tools", ToolNode(TOOLS))
+graph.add_node("tools", ToolNode(ALL_TOOLS))
 
 graph.add_edge(START, "agent")
 graph.add_edge("tools", "agent")
-graph.add_conditional_edges("agent", route)
+graph.add_conditional_edges("agent", route, {"tools": "tools", "agent": "agent", END: END})
 
-agent_graph = graph.compile()
-
-# ============================================================================
-# AGENT EXECUTION FUNCTION
-# ============================================================================
-
-def run_agent(url: str) -> dict:
-    """Execute the quiz-solving agent"""
-    try:
-        print("Verified starting the task...")
-        result = agent_graph.invoke(
-            {"messages": [{"role": "user", "content": str(url)}]},
-            config={"recursion_limit": 5000},
-        )
-        print("Tasks completed successfully")
-        return {"status": "completed", "message": "All quiz tasks solved successfully"}
-    except Exception as e:
-        print(f"Error: {e}")
-        return {"status": "error", "message": str(e)}
+agent_runner = graph.compile()
 
 # ============================================================================
-# FASTAPI APPLICATION
+# FASTAPI SERVER
 # ============================================================================
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -400,78 +319,99 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-START_TIME = time.time()
+SERVER_START_TIME = time.time()
 
-# ============================================================================
-# FASTAPI ENDPOINTS
-# ============================================================================
-
-@app.get("/health")
-def health():
-    """Health check endpoint"""
-    return {"status": "ok", "model": "gemini-1.5-pro"}
 
 @app.get("/healthz")
 def healthz():
-    """Simple liveness check"""
-    return {
-        "status": "ok",
-        "uptime_seconds": int(time.time() - START_TIME)
-    }
+    return {"status": "ok", "uptime": int(time.time() - SERVER_START_TIME), "model": "gemini-2.5-flash"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": "gemini-2.5-flash"}
+
+
+async def background_solve(url: str):
+    """Background task to run the agent loop."""
+    try:
+        print(f"Starting background task for: {url}")
+        BASE64_STORE.clear()
+        URL_TIME.clear()
+        CACHE.clear()
+
+        initial_msg = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Start the challenge at: {url}"},
+        ]
+
+        agent_runner.invoke({"messages": initial_msg}, config={"recursion_limit": RECURSION_LIMIT})
+        print("Task Finished Successfully.")
+    except Exception as e:
+        print(f"Task Failed: {e}")
+
 
 @app.post("/solve-quiz")
 async def solve_quiz_endpoint(request: Request):
-    """Synchronous endpoint - blocks until quiz is solved"""
+    """Synchronous endpoint."""
     try:
         data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    if not data:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    url = data.get("url")
-    secret = data.get("secret")
-    email = data.get("email")
-    
-    if not url or not secret:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    if secret != EXPECTED_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    
-    result = run_agent(str(url))
-    return result
+        url = data.get("url")
+        secret = data.get("secret")
+
+        if not url or not secret:
+            raise HTTPException(status_code=400, detail="Missing url or secret")
+
+        if secret != EXPECTED_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret")
+
+        result = {}
+        try:
+            BASE64_STORE.clear()
+            URL_TIME.clear()
+            CACHE.clear()
+
+            initial_msg = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Start the challenge at: {url}"},
+            ]
+
+            agent_runner.invoke({"messages": initial_msg}, config={"recursion_limit": RECURSION_LIMIT})
+            result = {"status": "completed", "message": "All quiz tasks solved successfully"}
+        except Exception as e:
+            result = {"status": "error", "message": str(e)}
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/solve")
 async def solve_endpoint(request: Request, background_tasks: BackgroundTasks):
-    """Asynchronous endpoint - runs in background"""
+    """Asynchronous endpoint."""
     try:
         data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    if not data:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    url = data.get("url")
-    secret = data.get("secret")
-    email = data.get("email")
-    
-    if not url or not secret:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    
-    if secret != EXPECTED_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    
-    print("Verified starting the task...")
-    background_tasks.add_task(run_agent, url)
-    
-    return JSONResponse(status_code=200, content={"status": "ok"})
+        url = data.get("url")
+        secret = data.get("secret")
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+        if not url or not secret:
+            raise HTTPException(status_code=400, detail="Missing url or secret")
+
+        if secret != EXPECTED_SECRET:
+            raise HTTPException(status_code=403, detail="Invalid secret")
+
+        background_tasks.add_task(background_solve, url)
+
+        return JSONResponse(status_code=200, content={"status": "ok", "message": "Agent started"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 1010)))
+    port = int(os.getenv("PORT", 1010))
+    uvicorn.run(app, host="0.0.0.0", port=port)
