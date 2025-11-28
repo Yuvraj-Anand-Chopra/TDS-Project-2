@@ -49,7 +49,7 @@ load_dotenv()
 EMAIL = os.getenv("EMAIL")
 SECRET = os.getenv("SECRET")
 EXPECTED_SECRET = os.getenv("SECRET")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
