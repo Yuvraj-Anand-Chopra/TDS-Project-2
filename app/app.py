@@ -1,7 +1,7 @@
 """
 AUTONOMOUS QUIZ SOLVER - Production Ready
-Self-contained app with all tools and advanced logic.
 Compatible with langchain-google-genai 1.0.5
+Model: gemini-1.5-pro (stable and supported)
 """
 
 import os
@@ -367,9 +367,9 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=5,
 )
 
-# Initialize LLM with gemini-1.5-flash (compatible with langchain-google-genai 1.0.5)
+# Initialize LLM with gemini-1.5-pro (STABLE & SUPPORTED)
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
+    model="gemini-1.5-pro",
     google_api_key=GOOGLE_API_KEY,
     rate_limiter=rate_limiter,
     safety_settings=safety_settings,
