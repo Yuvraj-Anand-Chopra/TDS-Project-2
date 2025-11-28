@@ -1,3 +1,9 @@
+"""
+CONSOLIDATED MAIN.PY - Single File Execution
+All logic from agent.py, tools.py, and main.py merged into one file.
+Execution: python app.py or uv run app.py
+"""
+
 # ============================================================================
 # IMPORTS - All dependencies at the top
 # ============================================================================
@@ -170,7 +176,9 @@ def run_code(code: str) -> str:
         
         f_out = io.StringIO()
         local_vars = {}
-        # FIX: Added 'os', 'hashlib', 'math' to global vars
+        
+        # CRITICAL FIX: Inject hashlib and math directly into the execution scope
+        # This prevents "name 'hashlib' is not defined" errors
         global_vars = {
             "pd": pd,
             "numpy": np,
@@ -245,10 +253,10 @@ safety_settings = {
 }
 
 # Initialize LLM with tool binding
-# FIX: Changed model to gemini-1.5-flash (2.5 does not exist yet)
+# USES GEMINI-1.5-PRO (Most stable model)
 llm = init_chat_model(
     model_provider="google_genai",
-    model="gemini-1.5-flash",
+    model="gemini-1.5-pro",
     rate_limiter=rate_limiter,
     safety_settings=safety_settings
 ).bind_tools(TOOLS)
@@ -401,7 +409,7 @@ START_TIME = time.time()
 @app.get("/health")
 def health():
     """Health check endpoint"""
-    return {"status": "ok", "model": "gemini-1.5-flash"}
+    return {"status": "ok", "model": "gemini-1.5-pro"}
 
 @app.get("/healthz")
 def healthz():
