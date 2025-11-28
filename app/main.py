@@ -52,7 +52,7 @@ class TaskSolver:
         """
         try:
             # Find all atob("...") patterns
-            matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\s]+)[`"\']\)', html_content)
+            matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\\\\s]+)[`"\']\)', html_content)
             
             decoded_parts = []
             for match in matches:
@@ -133,10 +133,10 @@ class TaskSolver:
             text = response.text.strip()
             
             # Check for markdown code blocks - use proper string
-            code_marker = "```python"
+            code_marker = "```
             if code_marker in text:
                 # Regex to find content between ```python and ```
-                code_match = re.search(r'```python(.*?)```', text, re.DOTALL)
+                code_match = re.search(r'```python(.*?)```
                 if code_match:
                     code = code_match.group(1)
                     logger.info("LLM generated Python code. Executing...")
@@ -192,14 +192,19 @@ class TaskSolver:
             # Fallback: assume /submit on same host
             parsed = urlparse(url)
             submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
+        
+        # ✅ FIX: Extract just the path from the quiz URL for submission
+        parsed_url = urlparse(url)
+        url_path = parsed_url.path if parsed_url.path else "/demo"
             
         logger.info(f"Submitting '{final_answer}' to {submit_url}")
+        logger.info(f"Using URL path: {url_path}")
         
         # 6. Submit
         payload = {
             "email": email,
             "secret": secret,
-            "url": url,
+            "url": url_path,  # ✅ FIXED: Use path only, not full URL
             "answer": final_answer
         }
         
@@ -244,7 +249,7 @@ async def solve_quiz_endpoint(request: Request):
     secret = req_data.secret
     
     iteration = 0
-    max_iterations = 10 # Safety break
+    max_iterations = 10  # Safety break
     
     last_response = {}
     
