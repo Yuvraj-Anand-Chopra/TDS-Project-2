@@ -13,9 +13,19 @@ openpyxl==3.1.2
 pillow==10.1.0
 playwright==1.40.0
 
-# === Modern, Fully Compatible LangChain Stack ===
-# Note: google-generativeai is removed because langchain-google-genai installs the correct version automatically
+# AI stack
 langchain==0.2.5
 langgraph==0.2.6
 langchain-google-genai==1.0.5
-# We let langgraph pull in the correct langchain-core (>=0.2.27) automatically to avoid conflicts
+
+# OCR (Python bindings)
+pytesseract==0.3.10
+
+# Audio recognition
+SpeechRecognition==3.10.0
+pydub==0.25.1
+
+# Helpful: If you do PDF-to-image
+pdf2image==1.17.0
+
+# Any optional extras - add as needed!
