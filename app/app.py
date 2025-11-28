@@ -1,9 +1,3 @@
-"""
-CONSOLIDATED MAIN.PY - Single File Execution
-All logic from agent.py, tools.py, and main.py merged into one file.
-Execution: python app.py or uv run app.py
-"""
-
 # ============================================================================
 # IMPORTS - All dependencies at the top
 # ============================================================================
@@ -14,6 +8,8 @@ import time
 import json
 import subprocess
 import logging
+import hashlib
+import math
 from typing import TypedDict, Annotated, List, Any, Dict, Optional
 from contextlib import redirect_stdout
 import io
@@ -103,7 +99,7 @@ def download_file(url: str, filename: str = None) -> str:
         
         logger.info(f"Downloaded from {url}, length: {len(response.text)}")
         
-        # FIX: Explicitly tell the LLM the PATH where it was saved
+        # Explicitly tell the LLM the PATH where it was saved
         return (f"File downloaded successfully. "
                 f"Saved at path: '{saved_path}'. "
                 f"Content length: {len(response.text)}. "
@@ -174,7 +170,7 @@ def run_code(code: str) -> str:
         
         f_out = io.StringIO()
         local_vars = {}
-        # FIX: Added 'os' to global vars so it can check paths
+        # FIX: Added 'os', 'hashlib', 'math' to global vars
         global_vars = {
             "pd": pd,
             "numpy": np,
@@ -183,7 +179,9 @@ def run_code(code: str) -> str:
             "json": json,
             "print": print,
             "BeautifulSoup": BeautifulSoup,
-            "os": os
+            "os": os,
+            "hashlib": hashlib,
+            "math": math
         }
         
         with redirect_stdout(f_out):
@@ -207,6 +205,10 @@ def add_dependencies(package_name: str) -> str:
     """
     try:
         print(f"\nInstalling {package_name}...\n")
+        # Optimization: hashlib is built-in, don't try to install it
+        if package_name == "hashlib":
+            return "Success: hashlib is a built-in library, no installation needed."
+            
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
         result = f"Successfully installed {package_name}"
         logger.info(result)
@@ -234,7 +236,7 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=9
 )
 
-# Safety settings to prevent "FinishReason: 10" errors on CSV/Text data
+# Safety settings
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -243,9 +245,10 @@ safety_settings = {
 }
 
 # Initialize LLM with tool binding
+# FIX: Changed model to gemini-1.5-flash (2.5 does not exist yet)
 llm = init_chat_model(
     model_provider="google_genai",
-    model="gemini-2.5-flash",
+    model="gemini-1.5-flash",
     rate_limiter=rate_limiter,
     safety_settings=safety_settings
 ).bind_tools(TOOLS)
@@ -270,12 +273,12 @@ FILE SYSTEM RULES (CRITICAL):
 DATA HANDLING RULES:
 - If you download a CSV/Data file, DO NOT download it again. Immediately read it using `run_code`.
 - Do not assume column names (e.g. 'value'). Always print `df.columns` first to verify.
-- If you encounter a "KeyError", it means the column name is different. Check the printed columns and retry with the correct name.
 
 GENERAL RULES:
 - NEVER stop early. Continue solving tasks until no new URL is provided.
 - NEVER hallucinate URLs, endpoints, fields, values, or JSON structure.
 - ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
+- **hashlib is pre-installed.** You do not need to install it. Just import it in your code.
 
 TIME LIMIT RULES:
 - Each task has a hard 3-minute limit.
@@ -398,7 +401,7 @@ START_TIME = time.time()
 @app.get("/health")
 def health():
     """Health check endpoint"""
-    return {"status": "ok", "model": "gemini-2.5-flash"}
+    return {"status": "ok", "model": "gemini-1.5-flash"}
 
 @app.get("/healthz")
 def healthz():
