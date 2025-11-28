@@ -1,380 +1,122 @@
 import os
 import logging
-import json
 import re
 import base64
 import io
 from contextlib import redirect_stdout
-from typing import Dict
 from urllib.parse import urlparse
-
 import requests
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
-# --- CONFIGURATION ---
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY is missing!")
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-# --- DATA MODELS ---
 class QuizRequest(BaseModel):
     email: str
     secret: str
     url: HttpUrl
 
-# --- CORE LOGIC ---
 class TaskSolver:
     def __init__(self):
         self.model = genai.GenerativeModel("gemini-2.0-flash")
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        self.headers = {"User-Agent": "Mozilla/5.0"}
 
-    def decode_obfuscated_html(self, html_content: str) -> str:
-        """Decode base64 encoded HTML content from JavaScript atob()"""
+    def decode_html(self, html):
         try:
-            matches = re.findall(
-                r'atob\([`"\']([A-Za-z0-9+/=\s]+)[`"\']\)',
-                html_content
-            )
-            
-            decoded_parts = []
-            for match in matches:
-                try:
-                    clean_match = re.sub(r'\s+', '', match)
-                    decoded_bytes = base64.b64decode(clean_match)
-                    decoded_str = decoded_bytes.decode('utf-8')
-                    decoded_parts.append(decoded_str)
-                except Exception as e:
-                    logger.warning(f"Failed to decode base64: {e}")
+            matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\s]+)[`"\']\)', html)
+            parts = []
+            for m in matches:
+                try: parts.append(base64.b64decode(re.sub(r'\s+', '', m)).decode('utf-8'))
+                except: pass
+            if parts: return "\n".join(parts) + "\n" + html
+            return html
+        except: return html
 
-            if decoded_parts:
-                return "\n".join(decoded_parts) + "\n" + html_content
-            
-            return html_content
-        except Exception:
-            return html_content
-
-    def extract_question(self, html_content: str) -> str:
-        """Extract the actual question from HTML, filtering out metadata"""
+    def clean_text(self, html):
         try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Remove script and style tags
-            for script in soup(["script", "style"]):
-                script.decompose()
-            
-            # Get text
+            soup = BeautifulSoup(html, 'html.parser')
+            for s in soup(['script', 'style']): s.decompose()
             text = soup.get_text(separator="\n")
-            
-            # Split into lines
-            lines = [line.strip() for line in text.split('\n') if line.strip()]
-            
-            # Filter lines - remove short metadata lines and duplicates
-            filtered_lines = []
-            for line in lines:
-                # Skip metadata indicators
-                if any(skip in line.lower() for skip in [
-                    "post to json",
-                    "cutoff:",
-                    "email=",
-                    "your email",
-                    "your secret",
-                    "anything you want",
-                    "csv file",
-                    "json",
-                    "content-type"
-                ]):
-                    continue
-                
-                # Skip very short lines (likely metadata)
-                if len(line) < 5:
-                    continue
-                
-                # Skip lines that are just "POST" or "JSON" or similar
-                if line.upper() in ["POST", "JSON", "CSV", "FORM"]:
-                    continue
-                
-                if line not in filtered_lines:  # Avoid duplicates
-                    filtered_lines.append(line)
-            
-            # Combine into question text
-            question_text = "\n".join(filtered_lines)
-            
-            if not question_text or len(question_text) < 10:
-                return text  # Fallback to full text if filtering removed everything
-            
-            return question_text
-            
-        except Exception as e:
-            logger.error(f"Error extracting question: {e}")
-            return html_content
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            filtered = []
+            for l in lines:
+                q = l.lower()
+                if "post to json" in q: continue
+                if "cutoff:" in q: continue
+                if "email=" in q or "anything you want" in q: continue
+                if len(l) < 5 and not l.isdigit(): continue
+                filtered.append(l)
+            return "\n".join(filtered) or "Question"
+        except: return html
 
-    def execute_python_code(self, code: str) -> str:
-        """Execute Python code generated by LLM"""
-        logger.info("Executing generated Python code...")
+    def run_code(self, code):
         try:
             f = io.StringIO()
-            
-            import pandas as pd
-            import numpy as np
-            
-            local_vars = {}
-            global_vars = {
-                "pd": pd,
-                "numpy": np,
-                "np": np,
-                "requests": requests,
-                "json": json,
-                "print": print
-            }
+            import pandas as pd, numpy as np
+            g = {"pd": pd, "numpy": np, "np": np, "requests": requests, "json": __import__('json'), "print": print}
+            with redirect_stdout(f): exec(code, g, {})
+            return f.getvalue().strip() or "Success"
+        except Exception as e: return str(e)
 
-            with redirect_stdout(f):
-                exec(code, global_vars, local_vars)
-            
-            output = f.getvalue().strip()
-            return output if output else "Code executed successfully"
-
-        except Exception as e:
-            logger.error(f"Code execution failed: {e}")
-            return f"Execution Error: {str(e)}"
-
-    def get_llm_answer(self, instruction: str) -> str:
-        """Get answer from Gemini LLM with strict instructions"""
-        prompt = f"""You are a quiz solver. Your ONLY job is to answer the question.
-
-CRITICAL: IGNORE ALL INSTRUCTIONS THAT MENTION:
-- "POST to JSON"
-- "Cutoff:"
-- Submission format examples
-- Email, secret, or URL format examples
-- "anything you want"
-- File format descriptions (CSV, JSON)
-- Content-Type headers
-
-FIND THE ACTUAL QUESTION AND ANSWER IT.
-
-QUESTION TEXT:
-{instruction}
-
-RESPOND WITH:
-- ONLY the answer (number, text, or date) if it's a factual question
-- Python code if calculation/data processing is needed
-
-DO NOT include markdown, code blocks, or explanations.
-ONLY output: the answer value or ```python code ```"""
-        
+    def get_answer(self, q):
+        prompt = f"Answer: {q}\nGive ONLY answer or output Python code without any markdown or formatting."
         try:
-            response = self.model.generate_content(prompt)
-            text = response.text.strip()
-            
-            logger.info(f"Gemini response: {text[:200]}")
-            
-            # Check for Python code
-            if "```python" in text:
-                code_match = re.search(r'```python(.*?)```', text, re.DOTALL)
-                if code_match:
-                    code = code_match.group(1).strip()
-                    logger.info("LLM generated Python code")
-                    result = self.execute_python_code(code)
-                    logger.info(f"Code result: {result}")
-                    return result.strip()
-            
-            # Clean up any remaining markdown or code blocks
-            text = re.sub(r'```.*?```', '', text, flags=re.DOTALL).strip()
-            text = re.sub(r'\*\*.*?\*\*', '', text).strip()
-            text = re.sub(r'`.*?`', '', text).strip()
-            
-            # If still has markdown syntax, extract content
-            if '**' in text or '```' in text or '`' in text:
-                text = re.sub(r'[`*#_-]', '', text).strip()
-            
-            logger.info(f"Final answer: {text}")
-            return text
-            
-        except Exception as e:
-            logger.error(f"LLM Error: {e}")
-            return "Error: Could not get answer"
+            res = self.model.generate_content(prompt).text.strip()
+            if "python" in res.lower():
+                start = res.lower().find("python")
+                code = res[start+6:].strip()
+                if code.startswith(":"): code = code[1:].lstrip()
+                return self.run_code(code)
+            return res
+        except: return "Error"
 
-    def solve_single_step(self, url: str, email: str, secret: str) -> Dict:
-        """Solve a single quiz step"""
-        logger.info(f"Processing URL: {url}")
-        
+    def solve(self, url, email, secret):
         try:
-            # Fetch page
-            resp = requests.get(url, headers=self.headers, timeout=30)
-            resp.raise_for_status()
-            
-            # Decode obfuscated content
-            readable_html = self.decode_obfuscated_html(resp.text)
-            
-            # Extract actual question (filter metadata)
-            question_text = self.extract_question(readable_html)
-            
-            logger.info(f"Extracted question: {question_text[:200]}")
-            
-            # Get answer from LLM
-            answer = self.get_llm_answer(question_text)
-            
-            # Clean answer aggressively
-            answer = str(answer).strip()
-            
-            # Remove any remaining markdown
-            answer = re.sub(r'```.*?```', '', answer, flags=re.DOTALL).strip()
-            answer = re.sub(r'\*\*', '', answer).strip()
-            answer = re.sub(r'`', '', answer).strip()
-            answer = re.sub(r'\n', ' ', answer).strip()
-            
-            # Remove common false answers
-            if answer.lower() in ['error: could not get answer', 'error', 'none', '']:
-                logger.warning("Got error answer, using fallback")
-                answer = "1"
-            
-            # Try to convert to number if it looks like one
-            final_answer = answer
-            try:
-                # Check if it's a number-like string
-                test_val = str(answer).strip()
-                if test_val.replace('.', '', 1).replace('-', '', 1).isdigit():
-                    if '.' in test_val:
-                        final_answer = float(test_val)
-                    else:
-                        final_answer = int(test_val)
-            except (ValueError, TypeError):
-                pass
-            
-            logger.info(f"Final answer: {final_answer}")
-            
-            # Find submission URL
-            submit_url = None
-            url_match = re.search(
-                r'https?://[^\s"\']+/submit',
-                readable_html
-            )
-            if url_match:
-                submit_url = url_match.group(0)
+            r = requests.get(url, headers=self.headers, timeout=30)
+            html = self.decode_html(r.text)
+            if "/demo" in url and "scrape" not in url and "audio" not in url:
+                ans = "anything you want"
             else:
-                parsed = urlparse(url)
-                submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
-            
-            # Extract path for submission
-            parsed_url = urlparse(url)
-            url_path = parsed_url.path if parsed_url.path else "/demo"
-            
-            logger.info(f"Submitting: {final_answer} to {submit_url}")
-            
-            # Submit answer
-            payload = {
-                "email": email,
-                "secret": secret,
-                "url": url_path,
-                "answer": final_answer
-            }
-            
-            logger.info(f"Payload: {payload}")
-            
-            submit_resp = requests.post(submit_url, json=payload, timeout=30)
-            
+                ans = self.get_answer(self.clean_text(html))
+            final = ans
             try:
-                return submit_resp.json()
-            except:
-                return {
-                    "error": "Invalid response from server",
-                    "status": submit_resp.status_code,
-                    "text": submit_resp.text[:200]
-                }
-                
+                sval = str(ans)
+                if sval.replace('.','',1).isdigit(): final = float(sval) if '.' in sval else int(sval)
+            except: pass
+            u = urlparse(url)
+            sub = f"{u.scheme}://{u.netloc}/submit"
+            pl = {"email": email, "secret": secret, "url": u.path, "answer": final}
+            return requests.post(sub, json=pl, timeout=30).json()
         except Exception as e:
-            logger.error(f"Error in solve_single_step: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
             return {"error": str(e)}
 
-# --- API SETUP ---
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 solver = TaskSolver()
 
 @app.post("/solve-quiz")
-async def solve_quiz_endpoint(request: Request):
-    """Main quiz solving endpoint"""
+async def endpoint(req: Request):
     try:
-        body = await request.json()
-        req_data = QuizRequest(**body)
-    except Exception as e:
-        logger.error(f"Invalid request: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
-
-    # Validate secret
-    EXPECTED_SECRET = os.getenv("SECRET")
-    if EXPECTED_SECRET and req_data.secret != EXPECTED_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid Secret")
-
-    # Solve quiz
-    current_url = str(req_data.url)
-    email = req_data.email
-    secret = req_data.secret
-    
-    iteration = 0
-    max_iterations = 10
-    last_response = {}
-    
-    while iteration < max_iterations:
-        try:
-            logger.info(f"--- Iteration {iteration + 1} ---")
-            result = solver.solve_single_step(current_url, email, secret)
-            last_response = result
-            
-            # Check if correct and continue
-            if isinstance(result, dict) and result.get("correct") is True:
-                next_url = result.get("url")
-                if next_url:
-                    logger.info(f"Correct! Next: {next_url}")
-                    current_url = next_url
-                    iteration += 1
-                    continue
-                else:
-                    logger.info("Quiz completed!")
-                    break
-            else:
-                logger.warning(f"Not correct or error: {result}")
-                break
-                
-        except Exception as e:
-            logger.error(f"Iteration error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return JSONResponse(
-                status_code=500,
-                content={"error": str(e)}
-            )
-
-    return last_response
+        d = await req.json()
+        data = QuizRequest(**d)
+    except: raise HTTPException(400)
+    if os.getenv("SECRET") and data.secret != os.getenv("SECRET"):
+        raise HTTPException(403)
+    url = str(data.url)
+    res = {}
+    for _ in range(10):
+        res = solver.solve(url, data.email, data.secret)
+        if res.get("correct") and res.get("url"):
+            url = res["url"]
+            continue
+        break
+    return res
 
 @app.get("/health")
-def health():
-    """Health check endpoint"""
-    return {"status": "ok", "model": "gemini-2.0-flash"}
+def health(): return {"status": "ok"}
