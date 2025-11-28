@@ -7,7 +7,7 @@ import io
 import subprocess
 import sys
 from contextlib import redirect_stdout
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from urllib.parse import urlparse, urljoin
 from pathlib import Path
 
@@ -46,6 +46,7 @@ class TaskSolver:
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         self.llm_files_dir = Path("LLMFiles")
         self.llm_files_dir.mkdir(exist_ok=True)
+        self.resource_cache = {}  # Cache downloaded resources
 
     def add_dependencies(self, package_name: str) -> str:
         try:
@@ -54,22 +55,34 @@ class TaskSolver:
         except Exception as e:
             return f"Error installing {package_name}: {str(e)}"
 
-    def download_file(self, url: str, filename: str) -> str:
+    def download_file(self, url: str, filename: str = None) -> str:
+        """Download file and return content"""
         try:
+            if url in self.resource_cache:
+                logger.info(f"Using cached resource: {url}")
+                return self.resource_cache[url]
+            
             response = requests.get(url, stream=True, timeout=30)
             response.raise_for_status()
-            path = self.llm_files_dir / filename
-            with open(path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            logger.info(f"Downloaded: {path}")
-            return str(path)
+            content = response.text
+            
+            # Cache it
+            self.resource_cache[url] = content
+            
+            if filename:
+                path = self.llm_files_dir / filename
+                with open(path, "w") as f:
+                    f.write(content)
+                logger.info(f"Downloaded and saved: {path}")
+            
+            logger.info(f"Downloaded from {url}, length: {len(content)}")
+            return content
         except Exception as e:
-            return f"Error downloading file: {str(e)}"
+            logger.error(f"Error downloading file: {e}")
+            return ""
 
     def get_rendered_html(self, url: str) -> str:
-        """Get HTML using requests (no Playwright to avoid asyncio conflicts)"""
+        """Get HTML using requests"""
         try:
             response = requests.get(url, headers=self.headers, timeout=30)
             html = response.text
@@ -80,159 +93,102 @@ class TaskSolver:
             return ""
 
     def decode_obfuscated_html(self, html_content: str) -> str:
-        """Decode base64-encoded content from atob() calls in script tags"""
+        """Decode base64-encoded content from atob() calls"""
         try:
-            # Extract all base64 strings from atob() calls
-            # Pattern: atob(`...base64...`) or atob("...base64...") or atob('...base64...')
             matches = re.findall(r'atob\([`"\']([A-Za-z0-9+/=\s]+)[`"\']\)', html_content)
             decoded_parts = []
             
             for match in matches:
                 try:
-                    # Remove whitespace from base64
                     clean_match = re.sub(r'\s+', '', match)
-                    # Decode
                     decoded_bytes = base64.b64decode(clean_match)
                     decoded_str = decoded_bytes.decode('utf-8')
                     decoded_parts.append(decoded_str)
-                    logger.info(f"Decoded base64 content: {decoded_str[:150]}")
+                    logger.info(f"Decoded base64: {decoded_str[:100]}")
                 except Exception as e:
                     logger.warning(f"Failed to decode base64: {e}")
             
-            # If we found decoded content, return it combined with original HTML
             if decoded_parts:
                 result = "\n".join(decoded_parts) + "\n" + html_content
-                logger.info(f"Total content length after decode: {len(result)}")
+                logger.info(f"Total content after decode: {len(result)} chars")
                 return result
             
             return html_content
         except Exception as e:
-            logger.error(f"Error in decode_obfuscated_html: {e}")
+            logger.error(f"Error decoding: {e}")
             return html_content
 
-    def extract_scraping_task(self, html_content: str, current_url: str) -> Optional[str]:
-        """Extract URLs that need to be scraped from href attributes"""
+    def extract_resources(self, html_content: str, current_url: str) -> List[str]:
+        """Extract all resource URLs from HTML (href, src, links, etc)"""
         try:
-            # Look for href attributes - these are in the DECODED content
-            link_pattern = r'href=["\']([^"\']+)["\']'
-            links = re.findall(link_pattern, html_content)
-            logger.info(f"Found {len(links)} links in page")
+            resources = []
             
-            for link in links:
-                logger.info(f"Checking link: {link}")
-                # Normalize relative URLs
-                if link.startswith('/'):
+            # href links
+            hrefs = re.findall(r'href=["\']([^"\']+)["\']', html_content)
+            # src attributes (scripts, images)
+            srcs = re.findall(r'src=["\']([^"\']+)["\']', html_content)
+            # fetch() calls
+            fetches = re.findall(r'fetch\(["\']([^"\']+)["\']', html_content)
+            # Plain URLs in text
+            plain_urls = re.findall(r'(https?://[^\s"\'<>]+)', html_content)
+            
+            all_urls = hrefs + srcs + fetches + plain_urls
+            
+            for url in all_urls:
+                # Normalize URL
+                if url.startswith('/'):
                     parsed = urlparse(current_url)
-                    full_url = f"{parsed.scheme}://{parsed.netloc}{link}"
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{url}"
+                elif url.startswith('http'):
+                    full_url = url
                 else:
-                    full_url = urljoin(current_url, link)
+                    full_url = urljoin(current_url, url)
                 
-                logger.info(f"Full URL: {full_url}")
-                
-                # Look for data-fetching URLs
-                if any(x in full_url.lower() for x in ['scrape', 'data', 'audio', 'file']):
-                    logger.info(f"✓ Found scraping URL: {full_url}")
-                    return full_url
+                # Filter for data/resource URLs
+                if any(x in full_url.lower() for x in ['data', 'scrape', 'audio', 'file', '.js', '.json']):
+                    if full_url not in resources:
+                        resources.append(full_url)
+                        logger.info(f"Found resource: {full_url}")
             
-            logger.info("No scraping URL found")
-            return None
+            logger.info(f"Total resources found: {len(resources)}")
+            return resources
         except Exception as e:
-            logger.error(f"Error extracting scraping task: {e}")
-            return None
-
-    def extract_secret_from_content(self, content: str) -> Optional[str]:
-        """Extract secret/answer from fetched content"""
-        try:
-            logger.info(f"Extracting secret from content (length: {len(content)})")
-            
-            # Look for common secret/code patterns
-            secret_patterns = [
-                (r'secret["\s:=]+([A-Za-z0-9_\-]+)', 'secret key'),
-                (r'code["\s:=]+([A-Za-z0-9_\-]+)', 'code'),
-                (r'answer["\s:=]+([A-Za-z0-9_\-]+)', 'answer'),
-                (r'<code>([A-Za-z0-9_\-]+)</code>', 'code tag'),
-                (r'<pre>([A-Za-z0-9_\-]+)</pre>', 'pre tag'),
-                (r'"([A-Za-z0-9]{20,})"', 'long string'),
-            ]
-            
-            for pattern, description in secret_patterns:
-                match = re.search(pattern, content, re.IGNORECASE)
-                if match:
-                    secret = match.group(1).strip()
-                    logger.info(f"✓ Extracted secret from {description}: {secret}")
-                    return secret
-            
-            # Try BeautifulSoup to extract text content
-            try:
-                soup = BeautifulSoup(content, 'html.parser')
-                for script in soup(["script", "style"]):
-                    script.decompose()
-                text = soup.get_text().strip()
-                
-                # Find longest continuous alphanumeric string
-                candidates = re.findall(r'[A-Za-z0-9_\-]{8,}', text)
-                if candidates:
-                    # Return the first unique long string
-                    for cand in candidates:
-                        if len(cand) >= 10:
-                            logger.info(f"✓ Extracted potential secret: {cand}")
-                            return cand
-            except:
-                pass
-            
-            logger.warning("Could not extract secret from content")
-            return None
-        except Exception as e:
-            logger.error(f"Error extracting secret: {e}")
-            return None
+            logger.error(f"Error extracting resources: {e}")
+            return []
 
     def extract_question(self, html_content: str) -> str:
         """Extract question text from HTML"""
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Remove script and style tags
             for script in soup(["script", "style"]):
                 script.decompose()
             
-            # Get text
             text = soup.get_text(separator="\n")
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             
             filtered_lines = []
             for line in lines:
-                # Filter out noise but keep meaningful instructions
-                skip_patterns = [
-                    "post to json",
-                    "cutoff:",
-                    "your secret",
-                    "anything you want",
-                    "csv file",
-                    "content-type",
-                    "application/json",
-                ]
+                skip_patterns = ["post to json", "cutoff:", "your secret", "anything you want", "csv file", "content-type", "application/json"]
                 
                 if any(skip in line.lower() for skip in skip_patterns):
                     continue
                 
-                # Keep lines with reasonable length
                 if len(line) < 2:
                     continue
                 
                 if line.upper() in ["POST", "JSON", "CSV", "FORM", "GET"]:
                     continue
                 
-                # Avoid duplicates
                 if line not in filtered_lines:
                     filtered_lines.append(line)
             
             question_text = "\n".join(filtered_lines)
             
-            # If result is too short or empty, return original text
             if not question_text or len(question_text.strip()) < 5:
                 return text
             
-            logger.info(f"Extracted question ({len(question_text)} chars): {question_text[:200]}")
+            logger.info(f"Extracted question: {question_text[:200]}")
             return question_text
         except Exception as e:
             logger.error(f"Error extracting question: {e}")
@@ -240,7 +196,7 @@ class TaskSolver:
 
     def run_code(self, code: str) -> str:
         """Execute generated Python code"""
-        logger.info("Executing generated Python code...")
+        logger.info("Executing Python code...")
         try:
             f = io.StringIO()
             import pandas as pd
@@ -255,19 +211,22 @@ class TaskSolver:
             logger.error(f"Code execution failed: {e}")
             return f"Execution Error: {str(e)}"
 
-    def get_llm_answer(self, instruction: str, page_url: str = "") -> str:
-        """Get answer from LLM based on instructions"""
-        prompt = f"""You are a quiz solver. Answer the question directly and concisely.
+    def get_llm_answer(self, instruction: str, additional_context: str = "") -> str:
+        """Get answer from LLM"""
+        context_part = f"\n\nADDITIONAL CONTEXT:\n{additional_context}" if additional_context else ""
+        
+        prompt = f"""You are a quiz solver. Analyze the content and provide the answer.
 
-INSTRUCTIONS:
+RULES:
 - Answer ONLY with the required value (number, text, URL, or code)
 - Do NOT explain or provide reasoning
 - Do NOT use markdown formatting
 - If code is needed, wrap in ```python ```
+- Calculate sums, values, or perform operations as requested
 
-PAGE: {page_url}
+CONTENT:{context_part}
 
-CONTENT:
+QUESTION:
 {instruction}
 
 ANSWER ONLY:"""
@@ -301,47 +260,39 @@ ANSWER ONLY:"""
             logger.error(f"LLM Error: {e}")
             return "Error"
 
-    def solve_single_step(self, url: str, email: str, secret: str) -> Dict[str, Any]:
-        """Solve a single quiz step"""
-        logger.info(f"Processing URL: {url}")
+    def solve_single_step(self, url: str, email: str, secret: str, retry_count: int = 0) -> Dict[str, Any]:
+        """Solve a single quiz step with retry logic"""
+        logger.info(f"Processing URL (attempt {retry_count + 1}): {url}")
         try:
-            # Get HTML (plain requests, no Playwright)
+            # Get HTML
             html = self.get_rendered_html(url)
             if not html:
                 logger.error("Failed to get HTML")
                 return {"error": "Failed to get HTML"}
             
-            # Decode any base64-encoded content
+            # Decode base64
             readable_html = self.decode_obfuscated_html(html)
             
-            # Check if this is a scraping task
-            scrape_url = self.extract_scraping_task(readable_html, url)
+            # Extract resources
+            resources = self.extract_resources(readable_html, url)
             
-            if scrape_url:
-                logger.info(f"Scraping task detected: {scrape_url}")
-                try:
-                    # Fetch the scraping URL
-                    scrape_response = requests.get(scrape_url, headers=self.headers, timeout=30)
-                    scrape_content = scrape_response.text
-                    logger.info(f"Scraped content length: {len(scrape_content)}")
-                    
-                    # Try to extract secret from scraped content
-                    extracted_secret = self.extract_secret_from_content(scrape_content)
-                    if extracted_secret:
-                        answer = extracted_secret
-                        logger.info(f"✓ Extracted secret from scrape: {answer}")
-                    else:
-                        # No secret found in content, ask Gemini
-                        logger.info("No secret pattern found, asking Gemini to analyze")
-                        answer = self.get_llm_answer(scrape_content[:1500], scrape_url)
-                except Exception as e:
-                    logger.error(f"Scraping failed: {e}")
-                    answer = "error"
-            else:
-                # Regular question - extract and ask Gemini
-                question_text = self.extract_question(readable_html)
-                logger.info(f"Extracted question: {question_text[:300]}")
-                answer = self.get_llm_answer(question_text, url)
+            # Download and analyze resources
+            resource_content = ""
+            if resources:
+                logger.info(f"Found {len(resources)} resources, downloading...")
+                for res_url in resources[:3]:  # Limit to first 3 resources
+                    try:
+                        res_content = self.download_file(res_url)
+                        if res_content:
+                            resource_content += f"\n--- Content from {res_url} ---\n{res_content[:2000]}\n"
+                    except Exception as e:
+                        logger.warning(f"Failed to download {res_url}: {e}")
+            
+            # Extract question
+            question_text = self.extract_question(readable_html)
+            
+            # Get answer
+            answer = self.get_llm_answer(question_text, resource_content)
             
             # Clean answer
             answer = str(answer).strip()
@@ -351,10 +302,10 @@ ANSWER ONLY:"""
             answer = re.sub(r'\n', ' ', answer).strip()
             
             if not answer or answer.lower() in ['error', 'none', '']:
-                logger.warning("Empty answer, using fallback")
+                logger.warning("Empty answer")
                 answer = "1"
             
-            # Try to convert to numeric if possible
+            # Try to convert to numeric
             final_answer = answer
             try:
                 test_val = str(answer).strip()
@@ -366,7 +317,7 @@ ANSWER ONLY:"""
             except (ValueError, TypeError):
                 pass
             
-            logger.info(f"Final answer to submit: {final_answer}")
+            logger.info(f"Final answer: {final_answer}")
             
             # Find submit URL
             submit_url = None
@@ -387,10 +338,10 @@ ANSWER ONLY:"""
             logger.info(f"Response text: {submit_resp.text}")
             
             data = submit_resp.json()
-            delay = data.get("delay")
-            correct = data.get("correct")
+            delay = data.get("delay", 0)
+            correct = data.get("correct", False)
             
-            # Handle response logic
+            # Handle response
             if not correct and delay and delay < 180:
                 if "url" in data:
                     del data["url"]
@@ -398,7 +349,7 @@ ANSWER ONLY:"""
             if delay and delay >= 180:
                 data = {"url": data.get("url")}
             
-            logger.info(f"Parsed response: {json.dumps(data, indent=2)}")
+            logger.info(f"Response: {json.dumps(data, indent=2)}")
             return data
             
         except Exception as e:
@@ -416,7 +367,7 @@ ANSWER ONLY:"""
         while iteration < max_iterations:
             try:
                 logger.info(f"=== Iteration {iteration + 1} ===")
-                result = self.solve_single_step(current_url, email, secret)
+                result = self.solve_single_step(current_url, email, secret, iteration)
                 
                 if isinstance(result, dict) and result.get("correct") is True:
                     next_url = result.get("url")
