@@ -1,3 +1,9 @@
+"""
+CONSOLIDATED MAIN.PY - Single File Execution
+All logic from agent.py, tools.py, and main.py merged into one file.
+Execution: python app.py or uv run app.py
+"""
+
 # ============================================================================
 # IMPORTS - All dependencies at the top
 # ============================================================================
@@ -86,19 +92,23 @@ def download_file(url: str, filename: str = None) -> str:
         response.raise_for_status()
         
         # Save to file if filename provided
+        saved_path = "memory"
         if filename:
             os.makedirs("LLMFiles", exist_ok=True)
             filepath = os.path.join("LLMFiles", filename)
             with open(filepath, "wb") as f:
                 f.write(response.content)
             logger.info(f"Downloaded and saved: {filepath}")
+            saved_path = filepath
         
         logger.info(f"Downloaded from {url}, length: {len(response.text)}")
         
-        # FIX: Explicitly tell the LLM what to do next to prevent looping
-        return (f"File downloaded successfully to {filename if filename else 'memory'}. "
+        # FIX: Explicitly tell the LLM the PATH where it was saved
+        return (f"File downloaded successfully. "
+                f"Saved at path: '{saved_path}'. "
                 f"Content length: {len(response.text)}. "
-                "IMPORTANT: Do not download this again. Immediately use 'run_code' to read and analyze this file.")
+                f"IMPORTANT: When reading this file in Python, you MUST use the path '{saved_path}'. "
+                "Do not download this again. Immediately use 'run_code' to read and analyze it.")
     except Exception as e:
         logger.error(f"Error downloading {url}: {e}")
         return f"Error downloading file: {str(e)}"
@@ -164,6 +174,7 @@ def run_code(code: str) -> str:
         
         f_out = io.StringIO()
         local_vars = {}
+        # FIX: Added 'os' to global vars so it can check paths
         global_vars = {
             "pd": pd,
             "numpy": np,
@@ -171,7 +182,8 @@ def run_code(code: str) -> str:
             "requests": requests,
             "json": json,
             "print": print,
-            "BeautifulSoup": BeautifulSoup
+            "BeautifulSoup": BeautifulSoup,
+            "os": os
         }
         
         with redirect_stdout(f_out):
@@ -222,7 +234,7 @@ rate_limiter = InMemoryRateLimiter(
     max_bucket_size=9
 )
 
-# FIX: Define Safety Settings to prevent "FinishReason: 10" (Recitation/Safety) errors
+# Safety settings to prevent "FinishReason: 10" errors on CSV/Text data
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -230,49 +242,47 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# Initialize LLM with tool binding and safety settings
+# Initialize LLM with tool binding
 llm = init_chat_model(
     model_provider="google_genai",
     model="gemini-2.5-flash",
     rate_limiter=rate_limiter,
-    safety_settings=safety_settings # Applying the fix here
+    safety_settings=safety_settings
 ).bind_tools(TOOLS)
 
-# System prompt - instructs the LLM how to solve the quiz
+# System prompt - Instructions for the LLM
 SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent.
 
 Your job is to:
 1. Load the quiz page from the given URL.
 2. Extract ALL instructions, required parameters, submission rules, and the submit endpoint.
 3. Solve the task exactly as required.
-4. Submit the answer ONLY to the endpoint specified on the current page (never make up URLs).
-5. Read the server response and:
-   - If it contains a new quiz URL → fetch it immediately and continue.
-   - If no new URL is present → return "END".
+4. Submit the answer ONLY to the endpoint specified on the current page.
 
 STRICT RULES — FOLLOW EXACTLY:
+
+FILE SYSTEM RULES (CRITICAL):
+- All files downloaded via 'download_file' are saved in the 'LLMFiles' subdirectory.
+- When you write Python code to read these files, you MUST use the path 'LLMFiles/filename'.
+- Example: `pd.read_csv('LLMFiles/data.csv')` or `open('LLMFiles/script.js')`.
+- If a file read fails, use `os.listdir('LLMFiles')` to check the actual filenames.
+
+DATA HANDLING RULES:
+- If you download a CSV/Data file, DO NOT download it again. Immediately read it using `run_code`.
+- Do not assume column names (e.g. 'value'). Always print `df.columns` first to verify.
+- If you encounter a "KeyError", it means the column name is different. Check the printed columns and retry with the correct name.
 
 GENERAL RULES:
 - NEVER stop early. Continue solving tasks until no new URL is provided.
 - NEVER hallucinate URLs, endpoints, fields, values, or JSON structure.
-- NEVER shorten or modify URLs. Always submit the full URL.
-- NEVER re-submit unless the server explicitly allows or it's within the 3-minute limit.
-- ALWAYS inspect the server response before deciding what to do next.
 - ALWAYS use the tools provided to fetch, scrape, download, render HTML, or send requests.
-
-DATA HANDLING RULES (CRITICAL):
-- If you download a CSV or Data file, DO NOT download it again. 
-- Your IMMEDIATELY NEXT step must be to use 'run_code' to read that file (e.g., using pandas) and perform the required analysis.
-- Do not just look at the file size; you must process the content.
 
 TIME LIMIT RULES:
 - Each task has a hard 3-minute limit.
-- The server response includes a "delay" field indicating elapsed time.
 - If your answer is wrong retry again.
 
 STOPPING CONDITION:
 - Only return "END" when a server response explicitly contains NO new URL.
-- DO NOT return END under any other condition.
 
 ADDITIONAL INFORMATION YOU MUST INCLUDE WHEN REQUIRED:
 - Email: {EMAIL}
