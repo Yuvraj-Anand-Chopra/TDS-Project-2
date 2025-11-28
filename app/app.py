@@ -1,7 +1,7 @@
 """
-CONSOLIDATED AUTONOMOUS QUIZ SOLVER - Production Ready
-Integrates: OCR, Audio, Web Scraping, Code Execution, Retry Logic, Context Trimming, Malformed JSON Handling
-All-in-one app.py: No external module imports required.
+AUTONOMOUS QUIZ SOLVER - Production Ready
+Self-contained app with all tools and advanced logic.
+Fixed dependency conflict: langchain-core==0.2.0 (compatible with langgraph 0.0.69)
 """
 
 import os
@@ -54,7 +54,7 @@ try:
     AUDIO_AVAILABLE = True
 except ImportError:
     AUDIO_AVAILABLE = False
-    print("Warning: speech_recognition/pydub not available. Audio transcription will fail gracefully.")
+    print("Warning: speech_recognition/pydub not available. Audio will fail gracefully.")
 
 try:
     from playwright.sync_api import sync_playwright
@@ -116,7 +116,7 @@ def get_rendered_html(url: str) -> str:
                 try:
                     page.goto(url, wait_until="networkidle", timeout=60000)
                 except Exception:
-                    pass  # Continue even if networkidle times out
+                    pass
                 content = page.content()
                 browser.close()
         else:
@@ -126,7 +126,6 @@ def get_rendered_html(url: str) -> str:
             response.raise_for_status()
             content = response.text
 
-        # Truncate to prevent token overflow
         if len(content) > 200000:
             print("HTML too large, truncating...")
             content = content[:200000] + "... [TRUNCATED]"
@@ -163,7 +162,6 @@ def run_code(code: str) -> str:
     """
     Execute Python code safely.
     Pre-loads: pandas, numpy, hashlib, base64, requests, bs4, math, re, random.
-    Returns plain string output.
     """
     try:
         print(f"\nExecuting code...")
@@ -222,7 +220,6 @@ def transcribe_audio(file_path: str) -> str:
 
         final_path = file_path
 
-        # Convert MP3 -> WAV
         if file_path.lower().endswith(".mp3"):
             sound = AudioSegment.from_mp3(file_path)
             final_path = file_path.replace(".mp3", ".wav")
@@ -260,10 +257,7 @@ def ocr_image_tool(image_path: str) -> str:
 
 @tool
 def encode_image_to_base64(image_path: str) -> str:
-    """
-    Convert image to Base64 and store it.
-    Returns a key (BASE64_KEY:...) instead of the full string.
-    """
+    """Convert image to Base64 and store it. Returns a key instead of full string."""
     try:
         if not image_path.startswith("LLMFiles") and not os.path.exists(image_path):
             image_path = os.path.join("LLMFiles", image_path)
@@ -282,9 +276,7 @@ def encode_image_to_base64(image_path: str) -> str:
 
 @tool
 def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
-    """
-    Send HTTP POST request with advanced retry logic and Base64 injection.
-    """
+    """Send HTTP POST request with retry logic and Base64 injection."""
     headers = headers or {"Content-Type": "application/json"}
 
     # Inject Base64 data if placeholder found
@@ -373,7 +365,7 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# Rate limiter (5 req/min to avoid 429 errors)
+# Rate limiter (5 req/min)
 rate_limiter = InMemoryRateLimiter(
     requests_per_second=5 / 60,
     check_every_n_seconds=1,
@@ -433,7 +425,7 @@ def agent_node(state: AgentState):
     prev_time = URL_TIME.get(cur_url)
     offset = os.getenv("offset", "0")
 
-    # Time handling: Force fail if timeout exceeded
+    # Time handling
     if prev_time is not None:
         prev_time = float(prev_time)
         diff = cur_time - prev_time
