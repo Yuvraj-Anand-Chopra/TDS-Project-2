@@ -1,7 +1,6 @@
 """
-LIGHTWEIGHT QUIZ SOLVER - WITH ACTUAL TOOL EXECUTION
-Key fix: Tools are actually executed and results returned to Gemini
-(No LangGraph - just proper tool calling pattern)
+LIGHTWEIGHT QUIZ SOLVER - WITH ACTUAL TOOL EXECUTION (FIXED PARSER)
+Key fix: Properly extract quoted strings from tool parameters
 """
 
 import os
@@ -179,7 +178,6 @@ def add_dependencies(package_name: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-# Map tool names to functions (like LangGraph ToolNode)
 TOOLS_MAP = {
     "get_rendered_html": get_rendered_html,
     "post_request": post_request,
@@ -190,53 +188,57 @@ TOOLS_MAP = {
 }
 
 # ============================================================================
-# TOOL CALLING AND EXECUTION ENGINE
+# TOOL CALLING AND EXECUTION ENGINE - FIXED PARSER
 # ============================================================================
 
-def parse_tool_call(response_text: str) -> tuple[str, dict]:
-    """Extract tool name and parameters from LLM response."""
-    # Look for patterns like: tool_name(param1="value", param2=123)
-    # or markdown code blocks with tool calls
+def parse_tool_call(response_text: str) -> tuple:
+    """Extract tool name and parameters from LLM response - FIXED VERSION."""
     
-    # Try to find function calls in code blocks
-    if "```" in response_text:
-        code_match = re.search(r'```(?:python)?\s*(.*?)```', response_text, re.DOTALL)
-        if code_match:
-            code = code_match.group(1).strip()
-            
-            # Look for function calls
-            func_pattern = r'(\w+)\s*\((.*?)\)'
-            matches = re.findall(func_pattern, code, re.DOTALL)
-            if matches:
-                func_name, params_str = matches[0]
-                
-                # Try to evaluate parameters
-                try:
-                    # Build a safe dict for eval with available functions
-                    safe_dict = {
-                        '__builtins__': {},
-                        'True': True,
-                        'False': False,
-                        'None': None,
-                    }
-                    
-                    # Try to parse as kwargs
-                    params = {}
-                    for param in re.findall(r'(\w+)\s*=\s*([^,\)]+)', params_str):
-                        key, val = param
-                        val = val.strip().strip('"\'')
-                        params[key] = val
-                    
-                    if not params:
-                        # Single positional argument
-                        match = re.search(r'\((.*?)\)', params_str)
-                        if match:
-                            arg = match.group(1).strip().strip('"\'')
-                            params['arg'] = arg
-                    
-                    return func_name, params
-                except:
-                    pass
+    if "```" not in response_text:
+        return None, None
+    
+    code_match = re.search(r'```(?:python)?\s*(.*?)```', response_text, re.DOTALL)
+    if not code_match:
+        return None, None
+    
+    code = code_match.group(1).strip()
+    
+    # Extract function calls: tool_name(...)
+    func_pattern = r'(\w+)\s*\((.*?)\)'
+    matches = re.findall(func_pattern, code, re.DOTALL)
+    
+    if not matches:
+        return None, None
+    
+    func_name, params_str = matches[0]
+    
+    try:
+        # Parse parameters: extract quoted strings AND other values
+        params = {}
+        
+        # Pattern 1: key="value" (quoted strings - PRIORITY)
+        quoted_params = re.findall(r'(\w+)\s*=\s*"([^"]*)"', params_str)
+        for key, val in quoted_params:
+            params[key] = val
+        
+        # Pattern 2: key=value (unquoted - for numbers, booleans)
+        unquoted_params = re.findall(r'(\w+)\s*=\s*([^\s,\)]+)', params_str)
+        for key, val in unquoted_params:
+            if key not in params and not val.startswith('"'):
+                params[key] = val.strip(',)')
+        
+        # If no named params, try single positional argument
+        if not params:
+            single_quote = re.search(r'"([^"]*)"', params_str)
+            if single_quote:
+                params['arg'] = single_quote.group(1)
+        
+        if params:
+            logger.info(f"✅ Parsed: {func_name}({params})")
+            return func_name, params
+    
+    except Exception as e:
+        logger.error(f"❌ Parse error: {e}")
     
     return None, None
 
