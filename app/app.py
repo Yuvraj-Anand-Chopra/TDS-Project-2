@@ -325,7 +325,7 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 print("⚡ Initializing Gemini 2.0 Flash (without tools)...")
 try:
-    model = genai.GenerativeModel(model_name='gemini-2.0-flash-exp')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     print("✅ Gemini 2.0 Flash initialized successfully!")
 except Exception as e:
     print(f"⚠️ Gemini 2.0 Flash failed: {e}")
