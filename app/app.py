@@ -6,7 +6,6 @@ AI-POWERED QUIZ SOLVER - PRODUCTION READY - FIXED PARSER
 - Handles chains of questions seamlessly
 - Can perform: file downloads, image parsing, calculations, text analysis, etc.
 """
-
 import os
 import sys
 import json
