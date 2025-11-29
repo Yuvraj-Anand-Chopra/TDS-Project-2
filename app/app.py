@@ -1,6 +1,6 @@
 """
-AI Quiz Solver - Production Version
-Main FastAPI application with all improvements integrated
+AI Quiz Solver - Project 2 Edition
+Enhanced FastAPI application for Project 2 with difficulty-aware solving
 """
 
 import os
@@ -35,15 +35,30 @@ SECRET = os.getenv("SECRET", "")
 EXPECTED_SECRET = os.getenv("SECRET", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
+# Project 2 specific configuration
+PROJECT_TYPE = "project2"
+INITIAL_URL = "https://tds-llm-analysis.s-anand.net/project2"
+SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
+
+# Difficulty levels mapping
+DIFFICULTY_LEVELS = {
+    1: {'name': 'Easy', 'next_url_always_shown': True, 'max_retries': 5},
+    2: {'name': 'Medium', 'next_url_always_shown': True, 'max_retries': 5},
+    3: {'name': 'Hard', 'next_url_always_shown': False, 'max_retries': 3},
+    4: {'name': 'Expert', 'next_url_always_shown': False, 'max_retries': 3},
+    5: {'name': 'Master', 'next_url_always_shown': False, 'max_retries': 2},
+}
+
 # Global stores
 BASE64_STORE = {}
 url_time = {}
 retry_cache = {}
 RETRY_LIMIT = 4
-TIMEOUT_LIMIT = 180
+TIMEOUT_LIMIT = 300  # Increased for longer Project 2 chains
+
 
 # ============================================================================
-# ERROR HANDLING & CLASSIFICATION (NEW - IMPROVEMENT #4)
+# ERROR HANDLING & CLASSIFICATION
 # ============================================================================
 
 class ErrorHandler:
@@ -62,19 +77,12 @@ class ErrorHandler:
         'unexpected keyword': 'parser_error',
         'Resource exhausted': 'quota_exceeded',
         'Connection': 'connection_error',
+        'wrong': 'answer_incorrect',
     }
     
     @staticmethod
     def classify_error(error: Exception) -> str:
-        """
-        Classify the type of error that occurred.
-        
-        Args:
-            error (Exception): The exception to classify
-            
-        Returns:
-            str: Error type category
-        """
+        """Classify the type of error that occurred."""
         error_str = str(error).lower()
         for pattern, error_type in ErrorHandler.ERROR_TYPES.items():
             if pattern.lower() in error_str:
@@ -84,15 +92,7 @@ class ErrorHandler:
     
     @staticmethod
     def get_recovery_strategy(error_type: str) -> dict:
-        """
-        Get the recovery strategy for a specific error type.
-        
-        Args:
-            error_type (str): Type of error
-            
-        Returns:
-            dict: Recovery strategy with retry parameters
-        """
+        """Get the recovery strategy for a specific error type."""
         strategies = {
             'rate_limit': {
                 'retry': True,
@@ -115,43 +115,28 @@ class ErrorHandler:
                 'max_retries': 3,
                 'action': 'retry_with_delay'
             },
-            'connection_error': {
+            'answer_incorrect': {
                 'retry': True,
-                'wait': 3,
-                'backoff': 'exponential',
+                'wait': 1,
+                'action': 'retry_different_approach',
                 'max_retries': 3,
-                'action': 'retry_connection'
+                'backoff': 'none'
             },
             'auth': {
                 'retry': False,
                 'action': 'fail_fast',
                 'log': 'critical'
             },
-            'unknown': {
-                'retry': False,
-                'action': 'log_and_fail',
-                'log': 'error'
-            }
         }
-        return strategies.get(error_type, strategies['unknown'])
+        return strategies.get(error_type, {'retry': False})
 
 
 # ============================================================================
-# RATE LIMITING DECORATOR (NEW - IMPROVEMENT #2)
+# RATE LIMITING DECORATOR
 # ============================================================================
 
 def rate_limit_aware(max_retries: int = 5):
-    """
-    Decorator that handles rate limiting with exponential backoff.
-    
-    Catches 429 errors and implements exponential backoff strategy.
-    
-    Args:
-        max_retries (int): Maximum number of retries
-        
-    Returns:
-        function: Decorated function with rate limit handling
-    """
+    """Decorator that handles rate limiting with exponential backoff."""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -164,7 +149,7 @@ def rate_limit_aware(max_retries: int = 5):
                     if '429' in str(e) or 'resource exhausted' in error_str:
                         logger.warning(f"Rate limited on attempt {attempt + 1}. Waiting {wait_time}s...")
                         time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, 32)  # Cap at 32s
+                        wait_time = min(wait_time * 2, 32)
                         if attempt < max_retries - 1:
                             continue
                     raise
@@ -174,28 +159,23 @@ def rate_limit_aware(max_retries: int = 5):
 
 
 # ============================================================================
-# CONTENT ANALYZER (NEW - IMPROVEMENT #3)
+# ENHANCED CONTENT ANALYZER (Project 2 Edition)
 # ============================================================================
 
 class ContentAnalyzer:
     """
     Analyzes HTML content to understand task requirements and extract data.
     
-    Can identify task types (sum, count, scrape) and extract relevant data
-    from HTML responses.
+    Enhanced for Project 2 to detect:
+    - Difficulty levels (1-5)
+    - Personalization status
+    - Required answer format
+    - Task instructions and hints
     """
     
     @staticmethod
     def extract_numbers(html: str) -> list:
-        """
-        Extract all numbers from HTML content.
-        
-        Args:
-            html (str): HTML content to parse
-            
-        Returns:
-            list: List of integers found in content
-        """
+        """Extract all numbers from HTML content."""
         try:
             text = BeautifulSoup(html, 'html.parser').get_text()
             numbers = re.findall(r'\d+', text)
@@ -206,15 +186,7 @@ class ContentAnalyzer:
     
     @staticmethod
     def extract_text_content(html: str) -> str:
-        """
-        Extract plain text from HTML.
-        
-        Args:
-            html (str): HTML content
-            
-        Returns:
-            str: Plain text content
-        """
+        """Extract plain text from HTML."""
         try:
             return BeautifulSoup(html, 'html.parser').get_text(strip=True)
         except Exception as e:
@@ -222,74 +194,191 @@ class ContentAnalyzer:
             return ""
     
     @staticmethod
-    def analyze_task(html: str) -> dict:
+    def extract_difficulty_level(html: str) -> int:
         """
-        Determine what task the HTML is asking for.
-        
-        Analyzes content and identifies task type (sum, count, scrape, etc.)
-        along with relevant data and computed answer.
+        Extract difficulty level from HTML (1-5).
         
         Args:
             html (str): HTML content
             
         Returns:
-            dict: Task analysis with type, data, and answer
+            int: Difficulty level 1-5, default 1 if not found
         """
-        text_lower = html.lower()
+        for level in range(1, 6):
+            patterns = [
+                f"Difficulty {level}",
+                f"difficulty {level}",
+                f"DIFFICULTY {level}",
+                f"Difficulty: {level}",
+                f"Level {level}",
+            ]
+            for pattern in patterns:
+                if pattern in html:
+                    logger.info(f"Difficulty level detected: {level}")
+                    return level
+        return 1  # Default to Easy
+    
+    @staticmethod
+    def extract_format_requirement(html: str) -> str:
+        """
+        Extract required answer format from task page.
         
-        # Check for sum task
-        if 'sum' in text_lower:
-            numbers = ContentAnalyzer.extract_numbers(html)
-            if numbers:
-                answer = sum(numbers)
-                logger.info(f"Task detected: SUM. Numbers: {numbers}, Answer: {answer}")
-                return {
-                    'type': 'sum',
-                    'data': numbers,
-                    'answer': str(answer),
-                    'confidence': 'high'
-                }
+        Looks for patterns like "Answer as [FORMAT]" or "Required format: [FORMAT]"
         
-        # Check for count task
-        if 'count' in text_lower:
-            numbers = ContentAnalyzer.extract_numbers(html)
-            if numbers:
-                logger.info(f"Task detected: COUNT. Count: {len(numbers)}")
-                return {
-                    'type': 'count',
-                    'data': numbers,
-                    'answer': str(len(numbers)),
-                    'confidence': 'high'
-                }
+        Args:
+            html (str): HTML content
+            
+        Returns:
+            str: Required format or "unknown"
+        """
+        patterns = [
+            r'answer\s+as\s+([^\.:\n]+)',
+            r'required\s+format[:\s]+([^\.:\n]+)',
+            r'format:\s*([^\.:\n]+)',
+            r'submit\s+as\s+([^\.:\n]+)',
+            r'answer\s*:\s*([^\.:\n]+)',
+        ]
         
-        # Check for scrape task
-        if 'scrape' in text_lower or 'extract' in text_lower:
-            text_content = ContentAnalyzer.extract_text_content(html)
-            logger.info(f"Task detected: SCRAPE")
+        for pattern in patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                format_str = match.group(1).strip()
+                logger.info(f"Answer format detected: {format_str}")
+                return format_str
+        
+        return "unknown"
+    
+    @staticmethod
+    def check_personalization(html: str) -> dict:
+        """
+        Check if task is personalized to email.
+        
+        Returns dict with personalization status and email if mentioned.
+        
+        Args:
+            html (str): HTML content
+            
+        Returns:
+            dict: {'personalized': bool, 'email': str or None, 'note': str}
+        """
+        # Check for explicit "Not personalized" marker
+        if "Not personalized" in html:
             return {
-                'type': 'scrape',
-                'data': text_content[:100],
-                'confidence': 'medium'
+                'personalized': False,
+                'email': None,
+                'note': 'This task accepts same answer for everyone'
             }
         
-        # Unknown task
+        # Check if email is mentioned
+        if EMAIL and EMAIL in html:
+            return {
+                'personalized': True,
+                'email': EMAIL,
+                'note': f'This task is personalized to {EMAIL}'
+            }
+        
+        # Check for generic email pattern mention
+        email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html)
+        if email_match:
+            return {
+                'personalized': True,
+                'email': email_match.group(1),
+                'note': 'This task mentions an email address'
+            }
+        
+        # Default: assume personalized if email could be relevant
         return {
-            'type': 'unknown',
-            'data': None,
-            'confidence': 'low'
+            'personalized': False,
+            'email': None,
+            'note': 'No personalization markers found'
         }
+    
+    @staticmethod
+    def extract_hints(html: str) -> list:
+        """
+        Extract hints or examples from the task page.
+        
+        Looks for common hint patterns like "Example:", "Hint:", "Note:", etc.
+        
+        Args:
+            html (str): HTML content
+            
+        Returns:
+            list: List of hints/notes found
+        """
+        hints = []
+        patterns = [
+            r'(?:Example|Hint|Note|Tip|Important)[:\s]+([^\n]+)',
+            r'(?:e\.g\.|For example)[:\s]+([^\n]+)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            hints.extend(matches)
+        
+        return list(set(hints))[:5]  # Return unique hints, max 5
+    
+    @staticmethod
+    def analyze_task(html: str) -> dict:
+        """
+        Comprehensive task analysis for Project 2.
+        
+        Analyzes HTML and returns all relevant task metadata.
+        
+        Args:
+            html (str): HTML content
+            
+        Returns:
+            dict: Complete task analysis
+        """
+        difficulty = ContentAnalyzer.extract_difficulty_level(html)
+        format_req = ContentAnalyzer.extract_format_requirement(html)
+        personalization = ContentAnalyzer.check_personalization(html)
+        hints = ContentAnalyzer.extract_hints(html)
+        numbers = ContentAnalyzer.extract_numbers(html)
+        
+        # Determine task type based on content
+        task_type = 'unknown'
+        answer_hint = None
+        
+        if 'sum' in html.lower():
+            task_type = 'sum'
+            if numbers:
+                answer_hint = str(sum(numbers))
+        elif 'count' in html.lower():
+            task_type = 'count'
+            if numbers:
+                answer_hint = str(len(numbers))
+        elif 'scrape' in html.lower() or 'extract' in html.lower():
+            task_type = 'scrape'
+        elif 'calculate' in html.lower():
+            task_type = 'calculation'
+        
+        analysis = {
+            'difficulty': difficulty,
+            'difficulty_name': DIFFICULTY_LEVELS.get(difficulty, {}).get('name', 'Unknown'),
+            'next_url_logic': 'always' if DIFFICULTY_LEVELS[difficulty]['next_url_always_shown'] else 'only_if_correct',
+            'format': format_req,
+            'personalized': personalization['personalized'],
+            'personalization_note': personalization['note'],
+            'task_type': task_type,
+            'hints': hints,
+            'numbers': numbers,
+            'answer_suggestion': answer_hint,
+        }
+        
+        logger.info(f"Task Analysis: {json.dumps({k: v for k, v in analysis.items() if k not in ['hints', 'numbers']}, indent=2)}")
+        
+        return analysis
 
 
 # ============================================================================
-# IMPROVED PARSER (IMPROVEMENT #1 - Fixed)
+# IMPROVED PARSER
 # ============================================================================
 
 def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
     """
-    Parse Gemini's tool calls from response text.
-    
-    FIXED: Now uses strict boundary detection to avoid extracting URL
-    query parameters as function arguments.
+    Parse Gemini's tool calls from response text with strict boundary detection.
     
     Args:
         response_text (str): Gemini's response text
@@ -301,15 +390,11 @@ def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
     if "```" not in response_text:
         return None, None
     
-    # Extract code block
     code_match = re.search(r'```(?:python|tool_code)?\s*(.*?)```', response_text, re.DOTALL)
     if not code_match:
         return None, None
     
     code = code_match.group(1).strip()
-    
-    # FIXED: Use strict boundary detection (^ and $ anchors)
-    # This prevents matching URL parameters as function arguments
     func_pattern = r'^(\w+)\s*\((.*)\)$'
     matches = re.findall(func_pattern, code, re.MULTILINE | re.DOTALL)
     
@@ -320,29 +405,25 @@ def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
     params = {}
     
     try:
-        # Extract quoted strings first (highest priority)
+        # Extract quoted strings first
         quoted_pattern = r'(\w+)\s*=\s*"([^"]*)"'
         for key, val in re.findall(quoted_pattern, params_str):
             params[key] = val
         
-        # Extract dictionary payloads (complete JSON with balanced braces)
+        # Extract dictionary payloads
         dict_pattern = r'(\w+)\s*=\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
         for key, val in re.findall(dict_pattern, params_str):
             try:
                 params[key] = json.loads(val)
-                logger.info(f"Parsed dict: {key}=<dict with {len(json.loads(val))} fields>")
             except Exception as e:
                 logger.warning(f"Could not parse dict {key}: {e}")
                 params[key] = val
         
-        # Extract unquoted values (but not if they look like URL parameters)
-        # Only match if not preceded by & and not containing special URL chars
+        # Extract unquoted values
         unquoted_pattern = r'(\w+)\s*=\s*([^\s,\)=]+)(?![\w&])'
         for key, val in re.findall(unquoted_pattern, params_str):
             if key not in params and not val.startswith('"') and not val.startswith('{'):
-                # Don't include if it looks like a URL parameter
-                if not (key in ['id', 'email', 'token'] and '=' in params_str[params_str.find(key):]):
-                    params[key] = val.strip(',)')
+                params[key] = val.strip(',)')
         
         if params:
             logger.info(f"Parsed: {func_name}({list(params.keys())})")
@@ -359,18 +440,7 @@ def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
 # ============================================================================
 
 def get_rendered_html(url: str) -> str:
-    """
-    Fetch rendered HTML content from a given URL.
-    
-    Makes an HTTP GET request to the provided URL and retrieves
-    the HTML content with proper headers and timeout handling.
-    
-    Args:
-        url (str): The URL to fetch
-        
-    Returns:
-        str: The HTML content of the page (limited to 200KB)
-    """
+    """Fetch rendered HTML content from a given URL."""
     try:
         logger.info(f"Fetching URL: {url}")
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -385,30 +455,15 @@ def get_rendered_html(url: str) -> str:
 
 
 def post_request(url: str, payload: Dict[str, Any]) -> str:
-    """
-    Submit an answer to the quiz server via POST request.
-    
-    Sends a JSON payload to the quiz server endpoint, handles the response,
-    logs server responses, and manages retry logic based on correctness
-    and timeout.
-    
-    Args:
-        url (str): The endpoint URL to POST to
-        payload (dict): JSON payload (email, secret, url, answer)
-        
-    Returns:
-        str: JSON string containing server response
-    """
+    """Submit an answer to the quiz server via POST request."""
     try:
         logger.info(f"Posting answer to: {url}")
         
-        # Handle base64 encoded answers
         if isinstance(payload.get("answer"), str) and payload["answer"].startswith("BASE64_KEY:"):
             key = payload["answer"].split(":", 1)[1]
             if key in BASE64_STORE:
                 payload["answer"] = BASE64_STORE[key]
         
-        # Log payload being sent (truncated for security)
         sending = {
             "email": payload.get("email", "")[:20] + "...",
             "url": payload.get("url", "")[:50] + "...",
@@ -416,21 +471,12 @@ def post_request(url: str, payload: Dict[str, Any]) -> str:
         }
         logger.info(f"Payload being sent: {json.dumps(sending, indent=2)}")
         
-        # Make request
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
         
-        # Log full server response with formatting
         logger.info(f"Server Response: {json.dumps(data, indent=2)}")
         
-        # Track retries
-        cur_url = os.getenv("url", "")
-        if cur_url not in retry_cache:
-            retry_cache[cur_url] = 0
-        retry_cache[cur_url] += 1
-        
-        # Check if answer is correct
         is_correct = data.get("correct", False)
         if is_correct:
             logger.info("Answer is correct")
@@ -445,18 +491,7 @@ def post_request(url: str, payload: Dict[str, Any]) -> str:
 
 
 def run_code(code: str) -> str:
-    """
-    Execute Python code in a subprocess.
-    
-    Creates a temporary Python file with the provided code and executes it
-    in a subprocess. Output and errors are captured and returned.
-    
-    Args:
-        code (str): Python code to execute
-        
-    Returns:
-        str: Execution output (stdout + stderr, max 3000 chars)
-    """
+    """Execute Python code in a subprocess."""
     try:
         logger.info("Executing Python code")
         os.makedirs("LLMFiles", exist_ok=True)
@@ -483,19 +518,7 @@ def run_code(code: str) -> str:
 
 
 def download_file(url: str, filename: str) -> str:
-    """
-    Download a file from a URL and save it locally.
-    
-    Downloads a file from the provided URL and saves it to the LLMFiles
-    directory. Handles streaming for large files.
-    
-    Args:
-        url (str): URL of the file to download
-        filename (str): Name to save the file as
-        
-    Returns:
-        str: Path to the saved file or error message
-    """
+    """Download a file from a URL and save it locally."""
     try:
         logger.info(f"Downloading {filename} from {url}")
         response = requests.get(url, timeout=30, stream=True)
@@ -514,18 +537,7 @@ def download_file(url: str, filename: str) -> str:
 
 
 def encode_image_to_base64(image_path: str) -> str:
-    """
-    Convert an image file to base64 encoding.
-    
-    Reads an image file and encodes it as base64. The encoded value is
-    stored in BASE64_STORE and a key is returned for later reference.
-    
-    Args:
-        image_path (str): Path to the image file
-        
-    Returns:
-        str: Key reference in format BASE64_KEY:uuid
-    """
+    """Convert an image file to base64 encoding."""
     try:
         if not image_path.startswith("LLMFiles"):
             image_path = os.path.join("LLMFiles", image_path)
@@ -541,18 +553,7 @@ def encode_image_to_base64(image_path: str) -> str:
 
 
 def add_dependencies(package_name: str) -> str:
-    """
-    Install a Python package using pip.
-    
-    Installs a Python package on demand using subprocess. Built-in
-    modules are skipped.
-    
-    Args:
-        package_name (str): Name of the package to install
-        
-    Returns:
-        str: Success or error message
-    """
+    """Install a Python package using pip."""
     try:
         if package_name in ["hashlib", "math", "json", "os", "sys", "re"]:
             return "Built-in"
@@ -575,19 +576,7 @@ TOOLS_MAP = {
 
 
 def execute_tool(tool_name: str, params: dict) -> str:
-    """
-    Execute a tool with the parsed parameters.
-    
-    Calls the appropriate tool function based on tool_name and passes
-    the parsed parameters to it. Includes error handling.
-    
-    Args:
-        tool_name (str): Name of the tool to execute
-        params (dict): Parsed parameters for the tool
-        
-    Returns:
-        str: Tool execution result
-    """
+    """Execute a tool with the parsed parameters."""
     if tool_name not in TOOLS_MAP:
         return f"Error: Unknown tool {tool_name}"
     
@@ -595,7 +584,6 @@ def execute_tool(tool_name: str, params: dict) -> str:
         logger.info(f"Executing tool: {tool_name}")
         tool_func = TOOLS_MAP[tool_name]
         
-        # Route to correct tool based on parameters
         if 'arg' in params:
             result = tool_func(params['arg'])
         elif 'url' in params and 'payload' in params:
@@ -639,77 +627,75 @@ except Exception as e:
 
 
 # ============================================================================
-# AUTONOMOUS QUIZ SOLVER AGENT (IMPROVED)
+# AUTONOMOUS QUIZ SOLVER AGENT (Project 2 Edition)
 # ============================================================================
 
 @rate_limit_aware(max_retries=5)
 def ask_gemini_with_rate_limit(messages: list) -> str:
-    """
-    Ask Gemini a question with built-in rate limit handling.
-    
-    Wrapped with rate_limit_aware decorator for automatic retry
-    with exponential backoff on 429 errors.
-    
-    Args:
-        messages (list): List of message objects for Gemini
-        
-    Returns:
-        str: Gemini's response text
-    """
+    """Ask Gemini a question with built-in rate limit handling."""
     response = model.generate_content(messages, stream=False)
     return response.text if response else ""
 
 
 def run_agent(url: str):
     """
-    Main agent loop for solving quiz questions.
+    Main agent loop for solving Project 2 quiz questions.
     
-    Iterative loop that:
-    1. Fetches the quiz page using Gemini
-    2. Analyzes the content (NEW - IMPROVEMENT #3)
-    3. Solves the problem
-    4. Submits the answer
-    5. Handles new URLs and retries with improved error handling (NEW - IMPROVEMENT #4)
-    
-    Args:
-        url (str): Starting URL for the quiz
+    Enhanced for Project 2 with:
+    - Difficulty level awareness
+    - Format compliance checking
+    - Personalization handling
+    - Retry logic based on difficulty
     """
-    logger.info(f"\nStarting quiz solver at: {url}\n")
+    logger.info(f"\nStarting Project 2 quiz solver at: {url}\n")
     
     current_url = url
     iteration = 0
-    max_iterations = 50
+    max_iterations = 100  # Increased for longer Project 2 chains
     message_history = []
+    task_attempts = {}  # Track attempts per task URL
     
     SYSTEM_PROMPT = (
-        "You are an expert autonomous quiz solver. Your ONLY job is to CALL TOOLS WITH ACTUAL VALUES.\n\n"
-        "CRITICAL RULES:\n"
-        "1. ALWAYS call tools directly with REAL values - NEVER use Python variables\n"
-        "2. EVERY iteration, you MUST make a tool call - don't explain, just call\n"
-        "3. After fetching page: analyze it and IMMEDIATELY post the answer\n"
-        "4. Always format tool calls like this:\n"
-        "   ```tool_code\n"
-        "   get_rendered_html(url=\"https://example.com/quiz\")\n"
-        "   ```\n\n"
-        f"CREDENTIALS (use exactly as shown):\n"
+        "You are an expert PROJECT 2 SOLVER. CRITICAL DIFFERENCES FROM DEMO:\n\n"
+        
+        "PROJECT 2 RULES:\n"
+        "1. Difficulty 1-2: Next URL always shown (even if wrong answer)\n"
+        "2. Difficulty 3-5: Next URL ONLY if answer is CORRECT\n"
+        "3. Each task page explicitly states required answer format\n"
+        "4. Some tasks are personalized to email, some are universal\n"
+        "5. Must solve correctly on difficulties 3-5 or get stuck\n\n"
+        
+        "CRITICAL SUCCESS FACTORS:\n"
+        "- Read answer format requirement CAREFULLY\n"
+        "- Check if task is personalized or not\n"
+        "- Understand the actual task (sum, extract, calculate, etc)\n"
+        "- Format your answer EXACTLY as required\n"
+        "- On difficulty 3-5, analyze failures and retry with different approaches\n\n"
+        
+        "WORKFLOW:\n"
+        "1. Call get_rendered_html to fetch the task page\n"
+        "2. READ the task carefully\n"
+        "3. Identify: difficulty, format requirement, personalization status\n"
+        "4. Analyze what's being asked\n"
+        "5. Solve the problem CORRECTLY\n"
+        "6. Format answer exactly as required\n"
+        "7. POST to https://tds-llm-analysis.s-anand.net/submit\n"
+        "8. If WRONG on difficulty 3-5: analyze and retry (different approach)\n"
+        "9. When CORRECT: continue to next URL\n"
+        "10. Repeat until all tasks completed\n\n"
+        
+        "CRITICAL WARNINGS:\n"
+        "- Difficulty 3-5 requires CORRECT answers - wrong = STUCK\n"
+        "- Answer format is NOT optional - must be exact\n"
+        "- Some tasks personalized - read carefully\n"
+        "- If wrong: analyze the error and try completely different approach\n\n"
+        
+        f"YOUR CREDENTIALS:\n"
         f"  Email: {EMAIL}\n"
         f"  Secret: {SECRET}\n"
-        f"  Submit to: https://tds-llm-analysis.s-anand.net/submit\n\n"
-        "WORKFLOW:\n"
-        "1. Call get_rendered_html to fetch the question page\n"
-        "2. Analyze the HTML to understand what's being asked\n"
-        "3. Solve the problem (math, parsing, download, etc)\n"
-        "4. Call post_request with your answer - INCLUDE ALL 4 FIELDS: email, secret, url, answer\n"
-        "5. If server returns new URL, continue with that URL\n"
-        "6. If server says 'correct', move to next URL\n"
-        "7. Repeat until no new URLs\n\n"
-        "Available tools:\n"
-        "- get_rendered_html(url=\"...\") - fetch webpage\n"
-        "- post_request(url=\"...\", payload={...}) - submit answer\n"
-        "- run_code(code=\"...\") - execute Python for calculations\n"
-        "- download_file(url=\"...\", filename=\"...\") - download files\n"
-        "- encode_image_to_base64(image_path=\"...\") - convert image to base64\n"
-        "- add_dependencies(package_name=\"...\") - install Python packages"
+        f"  Submit to: {SUBMIT_URL}\n\n"
+        
+        "Available tools: get_rendered_html, post_request, run_code, download_file"
     )
     
     try:
@@ -725,10 +711,28 @@ def run_agent(url: str):
             logger.info(f"ITERATION {iteration} | URL: {current_url} | Elapsed: {elapsed:.1f}s")
             logger.info(f"{'='*80}\n")
             
+            # Track attempts for this URL
+            attempts = task_attempts.get(current_url, 0)
+            if attempts > 0:
+                logger.info(f"Attempt {attempts + 1} for this task")
+            
             if iteration == 1:
-                prompt = f"{SYSTEM_PROMPT}\n\nSTART: Fetch and solve the quiz at {current_url}"
+                prompt = (
+                    f"{SYSTEM_PROMPT}\n\n"
+                    f"START: You are beginning Project 2.\n"
+                    f"First URL: {current_url}\n\n"
+                    f"Fetch this URL and analyze the task carefully.\n"
+                    f"Read ALL instructions before answering."
+                )
             else:
-                prompt = f"Continue. Next question URL: {current_url}\n\nFetch the page, analyze, solve, and POST your answer with ALL fields (email, secret, url, answer)."
+                prompt = (
+                    f"Continue to next task.\n"
+                    f"URL: {current_url}\n\n"
+                    f"Fetch the page, analyze the task, solve it, "
+                    f"and POST your answer with ALL fields: "
+                    f"email, secret, url, answer.\n"
+                    f"Format your answer EXACTLY as specified."
+                )
             
             message_history.append({"role": "user", "content": prompt})
             
@@ -762,17 +766,36 @@ def run_agent(url: str):
                 logger.info(f"Tool call detected: {tool_name}")
                 tool_result = execute_tool(tool_name, params)
                 
-                # Analyze content if HTML retrieved (NEW - IMPROVEMENT #3)
+                # Analyze content if HTML retrieved
                 if tool_name == 'get_rendered_html':
                     analysis = ContentAnalyzer.analyze_task(tool_result)
-                    logger.info(f"Content analysis: {analysis}")
-                    if analysis['type'] != 'unknown':
-                        tool_result += f"\n\n[ANALYSIS: Task type={analysis['type']}, Answer suggestion={analysis.get('answer', 'N/A')}]"
+                    logger.info(f"Task Analysis: Difficulty={analysis['difficulty']}, "
+                               f"Format={analysis['format']}, "
+                               f"Personalized={analysis['personalized']}, "
+                               f"Type={analysis['task_type']}")
+                    
+                    # Add analysis to tool result for Gemini
+                    tool_result += (
+                        f"\n\n[TASK METADATA]\n"
+                        f"Difficulty: {analysis['difficulty']} ({analysis['difficulty_name']})\n"
+                        f"Next URL will be {'always' if analysis['next_url_logic'] == 'always' else 'ONLY if CORRECT'} revealed\n"
+                        f"Required Format: {analysis['format']}\n"
+                        f"Personalized: {analysis['personalized']}\n"
+                        f"Task Type: {analysis['task_type']}\n"
+                        f"Personalization Note: {analysis['personalization_note']}\n"
+                    )
+                    if analysis['hints']:
+                        tool_result += f"Hints: {', '.join(analysis['hints'][:3])}\n"
+                    if analysis['answer_suggestion']:
+                        tool_result += f"Answer Suggestion: {analysis['answer_suggestion']}\n"
+                    tool_result += "[/TASK METADATA]"
                 
                 message_history.append({"role": "assistant", "content": text})
                 message_history.append({
                     "role": "user",
-                    "content": f"Tool {tool_name} returned:\n{tool_result}\n\nAnalyze this and continue solving. If correct, look for next URL. If not correct, try another answer."
+                    "content": f"Tool {tool_name} result:\n{tool_result}\n\n"
+                              f"Based on this, what should be your next action? "
+                              f"Solve the task and POST your answer if ready."
                 })
                 
                 # Trim history to prevent memory bloat
@@ -784,27 +807,34 @@ def run_agent(url: str):
             
             message_history.append({"role": "assistant", "content": text})
             
-            if "END" in text or "complete" in text.lower():
+            # Check if task marked complete
+            if "END" in text or "complete" in text.lower() or "all tasks" in text.lower():
                 logger.info("Quiz marked complete by Gemini")
                 break
             
-            # Extract URLs to continue chain
+            # Track attempts
+            if current_url not in task_attempts:
+                task_attempts[current_url] = 0
+            task_attempts[current_url] += 1
+            
+            # Extract next URLs from response
             urls = re.findall(r'https?://[^\s"\)\]]+', text)
             if urls:
                 next_url = urls[-1]
                 if next_url != current_url:
                     current_url = next_url
+                    task_attempts[current_url] = 0  # Reset attempts for new task
                     if current_url not in url_time:
                         url_time[current_url] = time.time()
-                    logger.info(f"Next URL found: {current_url}")
+                    logger.info(f"Next URL extracted: {current_url}")
                     continue
             
-            if iteration > 15:
+            if iteration > 20:
                 logger.warning("Too many iterations without tool call")
                 break
         
         elapsed = time.time() - url_time.get(current_url, time.time())
-        logger.info(f"\nQuiz solving session completed in {elapsed:.1f}s\n")
+        logger.info(f"\nProject 2 quiz solving session completed in {elapsed:.1f}s\n")
     
     except Exception as e:
         logger.error(f"Agent error: {e}")
@@ -826,20 +856,17 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    """
-    Health check endpoint.
-    
-    Returns the current status of the server and the Gemini model being used.
-    """
+    """Health check endpoint."""
     return {
         "status": "ok",
-        "model": "gemini-2.0-flash"
+        "model": "gemini-2.0-flash",
+        "project": "project2"
     }
 
 
 @app.get("/")
 def root():
-    """Root endpoint - same as /health."""
+    """Root endpoint."""
     return health()
 
 
@@ -850,17 +877,6 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
     
     This endpoint receives a POST request with email, secret, and quiz URL.
     It validates the secret and starts the quiz solver in the background.
-    The response is sent immediately while the solver runs in the background.
-    
-    Args:
-        request (Request): FastAPI request object
-        background_tasks (BackgroundTasks): Background task scheduler
-        
-    Returns:
-        JSONResponse: Acknowledgment response with status code 200
-        
-    Raises:
-        HTTPException: If JSON is invalid, missing fields, or secret is wrong
     """
     try:
         data = await request.json()
@@ -882,7 +898,7 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
     url_time.clear()
     BASE64_STORE.clear()
     
-    logger.info("Authentication successful. Starting quiz solver in background...")
+    logger.info(f"Project 2 authentication successful. Starting quiz solver for {quiz_url}...")
     os.environ["url"] = quiz_url
     os.environ["email"] = email
     url_time[quiz_url] = time.time()
@@ -902,5 +918,5 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
-    logger.info(f"\nStarting AI Quiz Solver on port {port}...\n")
+    logger.info(f"\nStarting Project 2 Quiz Solver on port {port}...\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
