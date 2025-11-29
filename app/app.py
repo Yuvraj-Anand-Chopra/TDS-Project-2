@@ -1,11 +1,3 @@
-"""
-AI-POWERED QUIZ SOLVER - PRODUCTION READY - FIXED PARSER
-- Receives quiz URLs via POST /solve-quiz endpoint
-- Uses Gemini 2.0 Flash to intelligently solve any question type
-- Automatically submits answers back to server
-- Handles chains of questions seamlessly
-- Can perform: file downloads, image parsing, calculations, text analysis, etc.
-"""
 import os
 import sys
 import json
@@ -45,23 +37,48 @@ TIMEOUT_LIMIT = 180
 # ============================================================================
 
 def get_rendered_html(url: str) -> str:
-    """Fetch HTML from URL - handles quiz page loading."""
+    """
+    Fetch rendered HTML content from a given URL.
+    
+    This function makes an HTTP GET request to the provided URL and retrieves
+    the HTML content. It includes proper headers and timeout handling.
+    
+    Args:
+        url (str): The URL to fetch
+        
+    Returns:
+        str: The HTML content of the page (limited to 200KB)
+    """
     try:
-        logger.info(f"📄 Fetching: {url}")
+        logger.info(f"Fetching URL: {url}")
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         content = response.text[:200000]
-        logger.info(f"✅ Retrieved {len(content)} chars")
+        logger.info(f"Retrieved {len(content)} characters")
         return content
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
+        logger.error(f"Error fetching URL: {str(e)}")
         return f"Error: {str(e)}"
 
+
 def post_request(url: str, payload: Dict[str, Any]) -> str:
-    """Submit answer to quiz server - THIS IS THE KEY FUNCTION."""
+    """
+    Submit an answer to the quiz server via POST request.
+    
+    This function sends a JSON payload to the quiz server endpoint and handles
+    the response. It logs the server response for debugging and manages retry
+    logic based on correctness and timeout.
+    
+    Args:
+        url (str): The endpoint URL to POST to
+        payload (dict): The JSON payload containing email, secret, url, and answer
+        
+    Returns:
+        str: JSON string containing server response
+    """
     try:
-        logger.info(f"📤 POSTING ANSWER to {url}")
+        logger.info(f"Posting answer to: {url}")
 
         if isinstance(payload.get("answer"), str) and payload["answer"].startswith("BASE64_KEY:"):
             key = payload["answer"].split(":", 1)[1]
@@ -73,13 +90,13 @@ def post_request(url: str, payload: Dict[str, Any]) -> str:
             "url": payload.get("url", ""),
             "answer": str(payload.get("answer", ""))[:100] if isinstance(payload.get("answer"), str) else payload.get("answer")
         }
-        logger.info(f"📦 Payload: {json.dumps(sending, indent=2)}")
+        logger.info(f"Payload being sent: {json.dumps(sending, indent=2)}")
 
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
 
-        logger.info(f"📥 Server Response: {json.dumps(data, indent=2)}")
+        logger.info(f"Server Response: {json.dumps(data, indent=2)}")
 
         cur_url = os.getenv("url", "")
         if cur_url not in retry_cache:
@@ -90,9 +107,9 @@ def post_request(url: str, payload: Dict[str, Any]) -> str:
         correct = data.get("correct", False)
 
         if correct:
-            logger.info("✅ ANSWER CORRECT!")
+            logger.info("Answer is correct")
         else:
-            logger.info("❌ Answer incorrect, will retry or move to next")
+            logger.info("Answer is incorrect, will retry or move to next")
 
         if not correct and next_url:
             if next_url not in url_time:
@@ -103,26 +120,38 @@ def post_request(url: str, payload: Dict[str, Any]) -> str:
             delay = cur_time - prev
 
             if retry_cache[cur_url] >= RETRY_LIMIT or delay >= TIMEOUT_LIMIT:
-                logger.info("⏭️ Moving to next question")
+                logger.info("Moving to next question")
                 return json.dumps({"url": next_url, "message": "Move to next"})
             else:
-                logger.info("🔄 Retrying this question")
+                logger.info("Retrying this question")
                 return json.dumps({"url": cur_url, "message": "Retry"})
 
         if not next_url:
-            logger.info("✅ Quiz chain complete!")
+            logger.info("Quiz chain complete")
             return json.dumps({"message": "Tasks completed"})
 
         return json.dumps(data)
 
     except Exception as e:
-        logger.error(f"❌ POST Error: {e}")
+        logger.error(f"POST Error: {str(e)}")
         return json.dumps({"error": str(e)})
 
+
 def run_code(code: str) -> str:
-    """Execute Python code for calculations/data processing."""
+    """
+    Execute Python code in a subprocess.
+    
+    This function creates a temporary Python file with the provided code and
+    executes it in a subprocess. Output and errors are captured and returned.
+    
+    Args:
+        code (str): Python code to execute
+        
+    Returns:
+        str: Execution output (stdout + stderr)
+    """
     try:
-        logger.info("🐍 Executing Python code...")
+        logger.info("Executing Python code")
         os.makedirs("LLMFiles", exist_ok=True)
         temp_file = os.path.join("LLMFiles", "runner.py")
 
@@ -139,15 +168,28 @@ def run_code(code: str) -> str:
         stdout, stderr = proc.communicate(timeout=30)
         result = (stdout + ("\nErrors:\n" + stderr if stderr else ""))[:3000]
 
-        logger.info(f"✅ Code executed: {result[:200]}")
+        logger.info(f"Code executed successfully: {result[:200]}")
         return result or "Executed"
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def download_file(url: str, filename: str) -> str:
-    """Download files needed for solving."""
+    """
+    Download a file from a URL and save it locally.
+    
+    This function downloads a file from the provided URL and saves it to the
+    LLMFiles directory. It handles streaming for large files.
+    
+    Args:
+        url (str): URL of the file to download
+        filename (str): Name to save the file as
+        
+    Returns:
+        str: Path to the saved file or error message
+    """
     try:
-        logger.info(f"⬇️ Downloading {filename}")
+        logger.info(f"Downloading {filename} from {url}")
         response = requests.get(url, timeout=30, stream=True)
         response.raise_for_status()
         os.makedirs("LLMFiles", exist_ok=True)
@@ -156,13 +198,25 @@ def download_file(url: str, filename: str) -> str:
             for chunk in response.iter_content(8192):
                 if chunk:
                     f.write(chunk)
-        logger.info(f"✅ Saved to {filepath}")
+        logger.info(f"File saved to {filepath}")
         return f"Saved: {filepath}"
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def encode_image_to_base64(image_path: str) -> str:
-    """Encode images for submission."""
+    """
+    Convert an image file to base64 encoding.
+    
+    This function reads an image file and encodes it as base64. The encoded
+    value is stored in BASE64_STORE and a key is returned for later reference.
+    
+    Args:
+        image_path (str): Path to the image file
+        
+    Returns:
+        str: Key reference in format BASE64_KEY:uuid
+    """
     try:
         if not image_path.startswith("LLMFiles"):
             image_path = os.path.join("LLMFiles", image_path)
@@ -170,21 +224,34 @@ def encode_image_to_base64(image_path: str) -> str:
             encoded = base64.b64encode(f.read()).decode("utf-8")
         key = str(uuid.uuid4())
         BASE64_STORE[key] = encoded
-        logger.info(f"✅ Image encoded, key: {key[:8]}...")
+        logger.info(f"Image encoded successfully, key: {key[:8]}")
         return f"BASE64_KEY:{key}"
     except Exception as e:
         return f"Error: {str(e)}"
 
+
 def add_dependencies(package_name: str) -> str:
-    """Install Python packages on demand."""
+    """
+    Install a Python package using pip.
+    
+    This function installs a Python package on demand using subprocess.
+    Built-in modules are skipped.
+    
+    Args:
+        package_name (str): Name of the package to install
+        
+    Returns:
+        str: Success or error message
+    """
     try:
         if package_name in ["hashlib", "math", "json", "os", "sys"]:
             return "Built-in"
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
-        logger.info(f"✅ Installed {package_name}")
+        logger.info(f"Installed {package_name}")
         return f"Installed {package_name}"
     except Exception as e:
         return f"Error: {str(e)}"
+
 
 TOOLS_MAP = {
     "get_rendered_html": get_rendered_html,
@@ -196,11 +263,23 @@ TOOLS_MAP = {
 }
 
 # ============================================================================
-# FIXED PARSER - HANDLES DICTIONARY PAYLOADS CORRECTLY
+# PARSER - HANDLES DICTIONARY PAYLOADS CORRECTLY
 # ============================================================================
 
 def parse_tool_call(response_text: str) -> tuple:
-    """Parse Gemini's tool calls - FIXED to handle dictionary payloads."""
+    """
+    Parse Gemini's tool calls from response text.
+    
+    This function extracts tool calls formatted in code blocks and parses
+    function names and parameters. It handles dictionary payloads with
+    balanced braces, quoted strings, and unquoted values.
+    
+    Args:
+        response_text (str): Gemini's response text
+        
+    Returns:
+        tuple: (function_name, parameters_dict) or (None, None) if not found
+    """
     
     if "```" not in response_text:
         return None, None
@@ -211,7 +290,6 @@ def parse_tool_call(response_text: str) -> tuple:
     
     code = code_match.group(1).strip()
     
-    # Extract function call
     func_pattern = r'(\w+)\s*\((.*)\)'
     matches = re.findall(func_pattern, code, re.DOTALL)
     
@@ -223,24 +301,23 @@ def parse_tool_call(response_text: str) -> tuple:
     try:
         params = {}
         
-        # FIXED: Handle dictionary payloads with balanced braces
-        # First, extract payload dictionaries by matching balanced braces
+        # Extract dictionary payloads by matching balanced braces
         dict_pattern = r'(\w+)\s*=\s*(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})'
         for key, val in re.findall(dict_pattern, params_str):
             try:
-                params[key] = json.loads(val)  # Parse as JSON dict
-                logger.info(f"✅ Parsed dict: {key}=<dict with {len(json.loads(val))} fields>")
+                params[key] = json.loads(val)
+                logger.info(f"Parsed dictionary: {key}=<dict with {len(json.loads(val))} fields>")
             except Exception as e:
                 logger.warning(f"Could not parse dict {key}: {e}")
-                params[key] = val  # Keep as string if not valid JSON
+                params[key] = val
         
-        # Then, extract quoted strings (don't override dict values)
+        # Extract quoted strings (don't override dict values)
         quoted_pattern = r'(\w+)\s*=\s*"([^"]*)"'
         for key, val in re.findall(quoted_pattern, params_str):
             if key not in params:
                 params[key] = val
         
-        # Finally, extract other unquoted values (URLs, etc)
+        # Extract unquoted values
         unquoted_pattern = r'(\w+)\s*=\s*([^\s,\)=]+)'
         for key, val in re.findall(unquoted_pattern, params_str):
             if key not in params and not val.startswith('"') and not val.startswith('{'):
@@ -253,27 +330,39 @@ def parse_tool_call(response_text: str) -> tuple:
                 params['arg'] = single_quote.group(1)
         
         if params:
-            logger.info(f"✅ Parsed: {func_name}({list(params.keys())})")
+            logger.info(f"Parsed: {func_name}({list(params.keys())})")
             return func_name, params
     
     except Exception as e:
-        logger.error(f"❌ Parse error: {e}")
+        logger.error(f"Parse error: {e}")
     
     return None, None
 
+
 def execute_tool(tool_name: str, params: dict) -> str:
-    """Execute the parsed tool with actual values."""
+    """
+    Execute a tool with the parsed parameters.
+    
+    This function calls the appropriate tool function based on tool_name and
+    passes the parsed parameters to it.
+    
+    Args:
+        tool_name (str): Name of the tool to execute
+        params (dict): Parsed parameters for the tool
+        
+    Returns:
+        str: Tool execution result
+    """
     if tool_name not in TOOLS_MAP:
         return f"Error: Unknown tool {tool_name}"
     
     try:
-        logger.info(f"🔧 Executing: {tool_name}")
+        logger.info(f"Executing tool: {tool_name}")
         tool_func = TOOLS_MAP[tool_name]
         
         if 'arg' in params:
             result = tool_func(params['arg'])
         elif 'url' in params and 'payload' in params:
-            # Payload is already a dict (from JSON parsing)
             payload = params['payload'] if isinstance(params['payload'], dict) else json.loads(params['payload'])
             result = tool_func(params['url'], payload)
         elif 'url' in params and 'filename' in params:
@@ -287,10 +376,10 @@ def execute_tool(tool_name: str, params: dict) -> str:
         else:
             result = tool_func(**params)
         
-        logger.info(f"✅ Result: {str(result)[:300]}")
+        logger.info(f"Tool result: {str(result)[:300]}")
         return str(result)
     except Exception as e:
-        logger.error(f"❌ Execution error: {e}")
+        logger.error(f"Execution error: {e}")
         return f"Error: {str(e)}"
 
 # ============================================================================
@@ -299,25 +388,37 @@ def execute_tool(tool_name: str, params: dict) -> str:
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-print("⚡ Initializing Gemini...")
+print("Initializing Gemini...")
 try:
     model = genai.GenerativeModel("gemini-2.0-flash-lite")
-    print("✅ Gemini 2.0 Flash Lite initialized!")
+    print("Gemini 2.0 Flash Lite initialized")
 except Exception as e:
-    print(f"⚠️ Trying Gemini 1.5 Flash...")
+    print(f"Trying Gemini 1.5 Flash...")
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
-        print("✅ Gemini 1.5 Flash initialized!")
+        print("Gemini 1.5 Flash initialized")
     except Exception as e2:
-        raise RuntimeError(f"Model init failed: {e2}")
+        raise RuntimeError(f"Model initialization failed: {e2}")
 
 # ============================================================================
 # AUTONOMOUS QUIZ SOLVER AGENT
 # ============================================================================
 
 def run_agent(url: str):
-    """Main agent loop - visits URL, reads question, solves it, submits answer."""
-    logger.info(f"\n🚀 Starting quiz solver at: {url}\n")
+    """
+    Main agent loop for solving quiz questions.
+    
+    This function runs an iterative loop that:
+    1. Fetches the quiz page using Gemini
+    2. Analyzes the content
+    3. Solves the problem
+    4. Submits the answer
+    5. Handles new URLs and retries
+    
+    Args:
+        url (str): Starting URL for the quiz
+    """
+    logger.info(f"\nStarting quiz solver at: {url}\n")
 
     current_url = url
     iteration = 0
@@ -365,7 +466,7 @@ def run_agent(url: str):
             elapsed = time.time() - (url_time.get(current_url, time.time()))
 
             if elapsed >= TIMEOUT_LIMIT:
-                logger.warning(f"⏰ TIMEOUT after {elapsed:.1f}s")
+                logger.warning(f"Timeout after {elapsed:.1f}s")
                 break
 
             logger.info(f"\n{'='*80}")
@@ -373,13 +474,13 @@ def run_agent(url: str):
             logger.info(f"{'='*80}\n")
 
             if iteration == 1:
-                prompt = f"{SYSTEM_PROMPT}\n\n🎯 START: Fetch and solve the quiz at {current_url}"
+                prompt = f"{SYSTEM_PROMPT}\n\nSTART: Fetch and solve the quiz at {current_url}"
             else:
                 prompt = f"Continue. Next question URL: {current_url}\n\nFetch the page, analyze, solve, and POST your answer with ALL fields (email, secret, url, answer)."
 
             message_history.append({"role": "user", "content": prompt})
 
-            logger.info("📢 Asking Gemini...\n")
+            logger.info("Asking Gemini...\n")
 
             response = model.generate_content(
                 [{"role": msg["role"], "parts": [msg["content"]]} for msg in message_history],
@@ -387,41 +488,36 @@ def run_agent(url: str):
             )
 
             if not response or not response.text:
-                logger.warning("⚠️ No response from model")
+                logger.warning("No response from model")
                 continue
 
             text = response.text
-            logger.info(f"📝 Gemini response ({len(text)} chars):\n{text[:800]}\n")
+            logger.info(f"Gemini response ({len(text)} chars):\n{text[:800]}\n")
 
-            # PARSE AND EXECUTE TOOL
             tool_name, params = parse_tool_call(text)
             
             if tool_name:
-                logger.info(f"🔧 Tool call detected: {tool_name}")
+                logger.info(f"Tool call detected: {tool_name}")
                 tool_result = execute_tool(tool_name, params)
                 
-                # Add to history for Gemini to see result
                 message_history.append({"role": "assistant", "content": text})
                 message_history.append({
                     "role": "user",
                     "content": f"Tool {tool_name} returned:\n{tool_result}\n\nAnalyze this and continue solving. If correct, look for next URL. If not correct, try another answer."
                 })
                 
-                # Keep conversation history manageable
                 if len(message_history) > 20:
-                    logger.info("📊 Trimming history...")
+                    logger.info("Trimming conversation history...")
                     message_history = message_history[:2] + message_history[-15:]
                 
                 continue
             
             message_history.append({"role": "assistant", "content": text})
 
-            # Check for quiz completion
             if "END" in text or "complete" in text.lower():
-                logger.info("✅ Quiz marked complete by Gemini")
+                logger.info("Quiz marked complete by Gemini")
                 break
 
-            # Extract new URLs from response
             urls = re.findall(r'https?://[^\s"\)\]]+', text)
             if urls:
                 next_url = urls[-1]
@@ -429,18 +525,18 @@ def run_agent(url: str):
                     current_url = next_url
                     if current_url not in url_time:
                         url_time[current_url] = time.time()
-                    logger.info(f"🔗 Next URL found: {current_url}")
+                    logger.info(f"Next URL found: {current_url}")
                     continue
 
             if iteration > 15:
-                logger.warning("⚠️ Too many iterations without tool call")
+                logger.warning("Too many iterations without tool call")
                 break
 
         elapsed = time.time() - url_time.get(current_url, time.time())
-        logger.info(f"\n✅ Quiz solving session completed in {elapsed:.1f}s\n")
+        logger.info(f"\nQuiz solving session completed in {elapsed:.1f}s\n")
 
     except Exception as e:
-        logger.error(f"❌ Agent error: {e}")
+        logger.error(f"Agent error: {e}")
 
 # ============================================================================
 # FASTAPI SERVER - RECEIVES REQUESTS AND STARTS SOLVER
@@ -459,7 +555,11 @@ START_TIME = time.time()
 
 @app.get("/health")
 def health():
-    """Health check endpoint - returns model status."""
+    """
+    Health check endpoint.
+    
+    Returns the current status of the server and the Gemini model being used.
+    """
     return {
         "status": "ok",
         "model": "gemini-2.0-flash"
@@ -472,7 +572,23 @@ def root():
 
 @app.post("/solve-quiz")
 async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
-    """Receive quiz URL and start solving."""
+    """
+    Receive quiz URL and start solving.
+    
+    This endpoint receives a POST request with email, secret, and quiz URL.
+    It validates the secret and starts the quiz solver in the background.
+    The response is sent immediately while the solver runs in the background.
+    
+    Args:
+        request (Request): FastAPI request object
+        background_tasks (BackgroundTasks): Background task scheduler
+        
+    Returns:
+        JSONResponse: Acknowledgment response with status code 200
+        
+    Raises:
+        HTTPException: If JSON is invalid, missing fields, or secret is wrong
+    """
     try:
         data = await request.json()
     except:
@@ -488,12 +604,11 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
     if secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
 
-    # Clear state
     retry_cache.clear()
     url_time.clear()
     BASE64_STORE.clear()
 
-    logger.info("✅ Authenticated. Starting quiz solver in background...")
+    logger.info("Authentication successful. Starting quiz solver in background...")
     os.environ["url"] = url
     os.environ["email"] = email
     url_time[url] = time.time()
@@ -512,5 +627,5 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
-    logger.info(f"\n🚀 Starting AI Quiz Solver on port {port}...\n")
+    logger.info(f"\nStarting AI Quiz Solver on port {port}...\n")
     uvicorn.run(app, host="0.0.0.0", port=port)
