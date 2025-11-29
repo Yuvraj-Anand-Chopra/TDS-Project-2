@@ -1,11 +1,16 @@
 """
-OPTIMIZED LLM ANALYSIS QUIZ SOLVER
-Single-file, lightweight implementation for Render deployment
-- Minimal dependencies: FastAPI, Requests, BeautifulSoup, LangGraph core
-- Direct Gemini API calls via langchain.chat_models.init_chat_model
-- Modular tool design with clean separation
+AUTONOMOUS QUIZ SOLVER - Direct Gemini API Implementation
+NO LangChain/LangGraph - Pure Google Generative AI with function calling
+
+Features:
+- PDF-to-image conversion
+- Audio recognition (SpeechRecognition)
+- OCR (Tesseract)
+- Direct Gemini API with function calling
+- 7 essential tools
 - 3-minute timeout handling
-- Proper error handling and retry logic
+- Error recovery
+- Background task execution
 """
 
 import os
@@ -16,34 +21,23 @@ import base64
 import uuid
 import subprocess
 import logging
-from typing import TypedDict, Annotated, List, Any, Dict, Optional
+import requests
+import base64
+from typing import Any, Dict, Optional, List
 from collections import defaultdict
 from dotenv import load_dotenv
 
-# ============================================================================
-# ESSENTIAL IMPORTS ONLY
-# ============================================================================
-
-# FastAPI
+# Core imports
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-# LangGraph minimal setup
-from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages
-from langchain_core.tools import tool
-from langchain_core.rate_limiters import InMemoryRateLimiter
-from langchain_core.messages import HumanMessage, trim_messages
-
-# LangChain lightweight model init
-from langchain.chat_models import init_chat_model
-
-# External utilities
-import requests
-from bs4 import BeautifulSoup
 import uvicorn
+
+# Google Generative AI (NO LangChain!)
+import google.generativeai as genai
+
+# Utilities
+from bs4 import BeautifulSoup
 
 # ============================================================================
 # CONFIGURATION & LOGGING
@@ -58,19 +52,19 @@ SECRET = os.getenv("SECRET", "")
 EXPECTED_SECRET = os.getenv("SECRET", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
-# State management - lightweight
+# State management
 BASE64_STORE = {}
 URL_TIME = {}
 CACHE = defaultdict(int)
 RETRY_LIMIT = 4
 MAX_TOKENS = 50000
 RECURSION_LIMIT = 5000
+TIMEOUT_LIMIT = 180  # 3 minutes
 
 # ============================================================================
-# TOOLS - Lightweight implementations
+# TOOL IMPLEMENTATIONS - Pure Python Functions
 # ============================================================================
 
-@tool
 def get_rendered_html(url: str) -> str:
     """Fetch and return HTML content from a URL."""
     try:
@@ -79,7 +73,6 @@ def get_rendered_html(url: str) -> str:
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
         
-        # Truncate large content
         content = response.text
         if len(content) > 200000:
             content = content[:200000] + "\n[CONTENT TRUNCATED]"
@@ -91,7 +84,6 @@ def get_rendered_html(url: str) -> str:
         return f"Error fetching URL: {str(e)}"
 
 
-@tool
 def download_file(url: str, filename: str = "download.txt") -> str:
     """Download a file from URL and save it to LLMFiles/."""
     try:
@@ -115,7 +107,6 @@ def download_file(url: str, filename: str = "download.txt") -> str:
         return f"Error downloading file: {str(e)}"
 
 
-@tool
 def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> str:
     """Send HTTP POST request to submit answer."""
     headers = headers or {"Content-Type": "application/json"}
@@ -155,7 +146,7 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         correct = data.get("correct")
         if not correct and next_url and CACHE[cur_url] < RETRY_LIMIT:
             delay = time.time() - URL_TIME.get(cur_url, time.time())
-            if delay < 180:
+            if delay < TIMEOUT_LIMIT:
                 data["message"] = "Incorrect. Analyze again and retry."
                 data["url"] = cur_url  # Retry same question
                 os.environ["offset"] = str(URL_TIME.get(cur_url, time.time()))
@@ -169,7 +160,6 @@ def post_request(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, 
         return json.dumps({"error": str(e)})
 
 
-@tool
 def run_code(code: str) -> str:
     """Execute Python code and return output."""
     try:
@@ -217,7 +207,6 @@ def run_code(code: str) -> str:
         return error_msg
 
 
-@tool
 def encode_image_to_base64(image_path: str) -> str:
     """Convert image to Base64 and store it. Returns key."""
     try:
@@ -236,7 +225,6 @@ def encode_image_to_base64(image_path: str) -> str:
         return f"Encoding error: {str(e)}"
 
 
-@tool
 def add_dependencies(package_name: str) -> str:
     """Install Python package."""
     try:
@@ -250,8 +238,6 @@ def add_dependencies(package_name: str) -> str:
         return f"Error installing {package_name}: {str(e)}"
 
 
-# OCR tool - optional, lazy loaded
-@tool
 def ocr_image_tool(image_path: str) -> str:
     """Extract text from image using OCR."""
     try:
@@ -270,46 +256,229 @@ def ocr_image_tool(image_path: str) -> str:
         return f"OCR error: {str(e)}"
 
 
+def transcribe_audio_tool(audio_path: str) -> str:
+    """Transcribe audio using SpeechRecognition."""
+    try:
+        import speech_recognition as sr
+        
+        if not audio_path.startswith("LLMFiles"):
+            audio_path = os.path.join("LLMFiles", audio_path)
+        
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(audio_path) as source:
+            audio = recognizer.record(source)
+        
+        try:
+            text = recognizer.recognize_google(audio)
+            return f"Transcription: {text}"
+        except sr.UnknownValueError:
+            return "Could not understand audio"
+        except sr.RequestError as e:
+            return f"API error: {e}"
+    except Exception as e:
+        return f"Transcription error: {str(e)}"
+
+
+def pdf_to_image_tool(pdf_path: str, output_prefix: str = "page") -> str:
+    """Convert PDF pages to images."""
+    try:
+        from pdf2image import convert_from_path
+        
+        if not pdf_path.startswith("LLMFiles"):
+            pdf_path = os.path.join("LLMFiles", pdf_path)
+        
+        os.makedirs("LLMFiles/pdf_images", exist_ok=True)
+        
+        images = convert_from_path(pdf_path)
+        saved_files = []
+        
+        for i, image in enumerate(images):
+            filename = f"LLMFiles/pdf_images/{output_prefix}_{i+1}.png"
+            image.save(filename, 'PNG')
+            saved_files.append(filename)
+        
+        return f"Converted {len(images)} pages. Saved: {', '.join(saved_files)}"
+    except Exception as e:
+        return f"PDF conversion error: {str(e)}"
+
+
 # ============================================================================
-# AGENT SETUP
+# TOOL MAPPING FOR GEMINI
 # ============================================================================
 
-TOOLS = [
-    get_rendered_html,
-    download_file,
-    post_request,
-    run_code,
-    encode_image_to_base64,
-    add_dependencies,
-    ocr_image_tool,
+TOOL_FUNCTIONS = {
+    "get_rendered_html": get_rendered_html,
+    "download_file": download_file,
+    "post_request": post_request,
+    "run_code": run_code,
+    "encode_image_to_base64": encode_image_to_base64,
+    "add_dependencies": add_dependencies,
+    "ocr_image_tool": ocr_image_tool,
+    "transcribe_audio_tool": transcribe_audio_tool,
+    "pdf_to_image_tool": pdf_to_image_tool,
+}
+
+# Gemini Tool Definitions
+TOOLS_DEFINITION = [
+    {
+        "name": "get_rendered_html",
+        "description": "Fetch and parse HTML content from a URL. Use this to load quiz pages.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch"
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "download_file",
+        "description": "Download a file from a URL and save it locally.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "URL of the file to download"
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Name to save the file as"
+                }
+            },
+            "required": ["url", "filename"]
+        }
+    },
+    {
+        "name": "post_request",
+        "description": "Send an HTTP POST request to submit an answer. Used to submit quiz responses.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The endpoint URL to POST to"
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "The JSON payload to send"
+                }
+            },
+            "required": ["url", "payload"]
+        }
+    },
+    {
+        "name": "run_code",
+        "description": "Execute Python code and return output. Use for calculations, data processing, etc.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute"
+                }
+            },
+            "required": ["code"]
+        }
+    },
+    {
+        "name": "encode_image_to_base64",
+        "description": "Convert an image file to Base64 encoding for submission.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "Path to the image file"
+                }
+            },
+            "required": ["image_path"]
+        }
+    },
+    {
+        "name": "add_dependencies",
+        "description": "Install a Python package if needed.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "package_name": {
+                    "type": "string",
+                    "description": "Name of the package to install"
+                }
+            },
+            "required": ["package_name"]
+        }
+    },
+    {
+        "name": "ocr_image_tool",
+        "description": "Extract text from an image using OCR (Tesseract).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "Path to the image file"
+                }
+            },
+            "required": ["image_path"]
+        }
+    },
+    {
+        "name": "transcribe_audio_tool",
+        "description": "Transcribe audio file to text using Google Speech Recognition.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "audio_path": {
+                    "type": "string",
+                    "description": "Path to the audio file"
+                }
+            },
+            "required": ["audio_path"]
+        }
+    },
+    {
+        "name": "pdf_to_image_tool",
+        "description": "Convert PDF pages to PNG images for processing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pdf_path": {
+                    "type": "string",
+                    "description": "Path to the PDF file"
+                },
+                "output_prefix": {
+                    "type": "string",
+                    "description": "Prefix for output image filenames"
+                }
+            },
+            "required": ["pdf_path"]
+        }
+    },
 ]
 
-# Rate limiter (4 requests per minute max)
-rate_limiter = InMemoryRateLimiter(
-    requests_per_second=4 / 60,
-    check_every_n_seconds=1,
-    max_bucket_size=4,
-)
+# ============================================================================
+# GEMINI MODEL INITIALIZATION
+# ============================================================================
 
-# Initialize LLM with lightweight init_chat_model
+genai.configure(api_key=GOOGLE_API_KEY)
+
 try:
-    llm = init_chat_model(
-        model_provider="google_genai",
-        model="gemini-2.0-flash-exp",
-        api_key=GOOGLE_API_KEY,
-        rate_limiter=rate_limiter,
-    ).bind_tools(TOOLS)
+    model = genai.GenerativeModel(
+        model_name='gemini-2.0-flash-exp',
+        tools=TOOLS_DEFINITION
+    )
 except Exception as e:
     logger.warning(f"⚠️ Primary model failed: {e}. Trying gemini-1.5-pro")
-    llm = init_chat_model(
-        model_provider="google_genai",
-        model="gemini-1.5-pro",
-        api_key=GOOGLE_API_KEY,
-        rate_limiter=rate_limiter,
-    ).bind_tools(TOOLS)
+    model = genai.GenerativeModel(
+        model_name='gemini-1.5-pro',
+        tools=TOOLS_DEFINITION
+    )
 
-
-SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent with 7 specialized tools.
+SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent with 9 specialized tools.
 
 CRITICAL INSTRUCTIONS:
 
@@ -317,7 +486,7 @@ CRITICAL INSTRUCTIONS:
 2. Extract instructions and identify the submit endpoint
 3. Solve ALL tasks correctly using available tools
 4. Submit answers ONLY to the correct endpoint with post_request
-5. Follow new URLs until completion, then return END
+5. Follow new URLs until completion, then output: END
 
 TOOLS AVAILABLE:
 - get_rendered_html: Fetch full page content
@@ -327,6 +496,8 @@ TOOLS AVAILABLE:
 - encode_image_to_base64: Convert images to Base64
 - add_dependencies: Install packages
 - ocr_image_tool: Extract text from images
+- transcribe_audio_tool: Convert audio to text
+- pdf_to_image_tool: Convert PDF pages to images
 
 RULES:
 - For base64 generation of images, ALWAYS use encode_image_to_base64 tool, NEVER create your own
@@ -337,130 +508,29 @@ RULES:
 - Email: {EMAIL}
 - Secret: {SECRET}
 
-Proceed immediately!"""
+Proceed immediately! Load the URL and start solving."""
 
 
 # ============================================================================
-# LANGGRAPH STATE & NODES
+# AGENT EXECUTION - Direct Gemini API
 # ============================================================================
 
-class AgentState(TypedDict):
-    """Agent state for message passing."""
-    messages: Annotated[List, add_messages]
-
-
-def handle_malformed_node(state: AgentState):
-    """Handle malformed JSON responses from LLM."""
-    print("--- DETECTED MALFORMED JSON. ASKING AGENT TO RETRY ---")
-    return {
-        "messages": [
-            HumanMessage(
-                content="SYSTEM ERROR: Your last tool call had invalid JSON. Please rewrite it and try again. Ensure you escape newlines and quotes correctly."
-            )
-        ]
-    }
-
-
-def agent_node(state: AgentState):
-    """Execute agent step with timeout handling."""
-    
-    # TIME HANDLING
-    cur_time = time.time()
-    cur_url = os.getenv("url")
-    prev_time = URL_TIME.get(cur_url)
-    offset = os.getenv("offset", "0")
-    
-    if prev_time is not None:
-        diff = cur_time - prev_time
-        if diff >= 180 or (offset != "0" and (cur_time - float(offset)) > 90):
-            print(f"Timeout exceeded ({diff}s) — submitting wrong answer")
-            fail_instruction = """You have exceeded the time limit for this task (over 180 seconds).
-            
-Immediately call the post_request tool and submit a WRONG answer for the CURRENT quiz."""
-            
-            fail_msg = HumanMessage(content=fail_instruction)
-            result = llm.invoke(state["messages"] + [fail_msg])
-            return {"messages": [result]}
-    
-    # MESSAGE TRIMMING
-    trimmed_messages = trim_messages(
-        messages=state["messages"],
-        max_tokens=MAX_TOKENS,
-        strategy="last",
-        include_system=True,
-        start_on="human",
-        token_counter=llm,
-    )
-    
-    # Ensure human message exists
-    has_human = any(msg.type == "human" for msg in trimmed_messages)
-    if not has_human:
-        print("WARNING: Context trimmed too far. Injecting reminder.")
-        current_url = os.getenv("url", "Unknown URL")
-        reminder = HumanMessage(
-            content=f"Context cleared due to length. Continue processing URL: {current_url}"
-        )
-        trimmed_messages.append(reminder)
-    
-    print(f"--- INVOKING AGENT (Context: {len(trimmed_messages)} items) ---")
-    result = llm.invoke(trimmed_messages)
-    return {"messages": [result]}
-
-
-def route(state):
-    """Route logic: determine next step."""
-    last = state["messages"][-1]
-    
-    # Check for malformed calls
-    if hasattr(last, "response_metadata"):
-        if last.response_metadata.get("finish_reason") == "MALFORMED_FUNCTION_CALL":
-            return "handle_malformed"
-    
-    # Check for tool calls
-    tool_calls = getattr(last, "tool_calls", None)
-    if tool_calls:
-        print("Route → tools")
-        return "tools"
-    
-    # Check for END
-    content = getattr(last, "content", None)
-    if isinstance(content, str) and content.strip() == "END":
-        return END
-    
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        if content[0].get("text", "").strip() == "END":
-            return END
-    
-    print("Route → agent")
-    return "agent"
-
-
-# Build graph
-graph = StateGraph(AgentState)
-graph.add_node("agent", agent_node)
-graph.add_node("tools", ToolNode(TOOLS))
-graph.add_node("handle_malformed", handle_malformed_node)
-
-graph.add_edge(START, "agent")
-graph.add_edge("tools", "agent")
-graph.add_edge("handle_malformed", "agent")
-
-graph.add_conditional_edges(
-    "agent",
-    route,
-    {
-        "tools": "tools",
-        "agent": "agent",
-        "handle_malformed": "handle_malformed",
-        END: END,
-    },
-)
-
-agent_graph = graph.compile()
+def process_tool_call(tool_name: str, tool_input: Dict[str, Any]) -> str:
+    """Execute tool function and return result."""
+    try:
+        func = TOOL_FUNCTIONS.get(tool_name)
+        if not func:
+            return f"Unknown tool: {tool_name}"
+        
+        result = func(**tool_input)
+        return str(result)
+    except Exception as e:
+        logger.error(f"Error executing {tool_name}: {e}")
+        return f"Error: {str(e)}"
 
 
 def run_agent(url: str):
-    """Execute the quiz-solving agent."""
+    """Execute the quiz-solving agent using direct Gemini API."""
     print(f"\n🚀 Starting task: {url}\n")
     
     # Clear state
@@ -471,22 +541,96 @@ def run_agent(url: str):
     os.environ["url"] = url
     os.environ["offset"] = "0"
     URL_TIME[url] = time.time()
+    start_time = time.time()
     
     try:
-        initial_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": url},
-        ]
+        # Initialize chat with system prompt
+        chat = model.start_chat(history=[])
         
-        agent_graph.invoke(
-            {"messages": initial_messages},
-            config={"recursion_limit": RECURSION_LIMIT},
-        )
+        # Send initial message with URL
+        initial_message = f"{SYSTEM_PROMPT}\n\nStart with this URL: {url}"
+        print(f"📢 Sending to Gemini:\n{initial_message}\n")
+        response = chat.send_message(initial_message)
         
-        print("\n✅ Task completed successfully!\n")
+        # Agent loop - continue until END or timeout
+        iteration = 0
+        max_iterations = 50
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= TIMEOUT_LIMIT:
+                print(f"\n⏰ TIMEOUT: {elapsed:.1f}s elapsed. Instructing agent to fail gracefully.")
+                timeout_msg = "You have exceeded the 180-second time limit. Submit a WRONG answer immediately."
+                response = chat.send_message(timeout_msg)
+                break
+            
+            print(f"\n{'='*80}")
+            print(f"ITERATION {iteration} | Elapsed: {elapsed:.1f}s")
+            print(f"{'='*80}")
+            
+            # Check for END in response
+            if hasattr(response, 'text'):
+                text = response.text
+                print(f"📝 Response text: {text[:500]}")
+                if "END" in text:
+                    print("\n✅ Agent completed task!")
+                    break
+            
+            # Process tool calls
+            tool_calls_made = False
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                
+                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                    for part in candidate.content.parts:
+                        if hasattr(part, 'function_call'):
+                            tool_calls_made = True
+                            tool_call = part.function_call
+                            tool_name = tool_call.name
+                            tool_input = dict(tool_call.args)
+                            
+                            print(f"\n🔧 Tool called: {tool_name}")
+                            print(f"   Input: {json.dumps(tool_input, indent=2)[:300]}")
+                            
+                            # Execute tool
+                            result = process_tool_call(tool_name, tool_input)
+                            print(f"   Result: {result[:300]}")
+                            
+                            # Send tool result back to model
+                            response = chat.send_message(
+                                genai.protos.Content(
+                                    parts=[
+                                        genai.protos.Part(
+                                            function_response=genai.protos.FunctionResponse(
+                                                name=tool_name,
+                                                response={"result": result}
+                                            )
+                                        )
+                                    ]
+                                )
+                            )
+            
+            if not tool_calls_made:
+                # No more tool calls, check for END
+                if hasattr(response, 'text') and "END" in response.text:
+                    print("\n✅ Agent completed!")
+                    break
+                else:
+                    print("⚠️ No tool calls made, sending continuation prompt")
+                    response = chat.send_message("Continue solving the quiz. Use the tools to fetch pages and submit answers.")
+        
+        if iteration >= max_iterations:
+            print(f"\n⚠️ Reached maximum iterations ({max_iterations})")
+        
+        elapsed = time.time() - start_time
+        print(f"\n✅ Task completed in {elapsed:.1f}s\n")
+        
     except Exception as e:
+        logger.error(f"❌ Agent error: {e}")
         print(f"\n❌ Task failed: {e}\n")
-        logger.error(f"Agent error: {e}")
 
 
 # ============================================================================
@@ -506,15 +650,20 @@ app.add_middleware(
 START_TIME = time.time()
 
 
+@app.get("/")
+def root():
+    """Root health check endpoint - replaces /healthz."""
+    return {
+        "status": "ok",
+        "uptime": int(time.time() - START_TIME),
+        "service": "Quiz Solver",
+        "timestamp": time.time()
+    }
+
+
 @app.get("/health")
 def health():
-    """Health check endpoint."""
-    return {"status": "ok", "uptime": int(time.time() - START_TIME)}
-
-
-@app.get("/healthz")
-def healthz():
-    """Liveness probe for Render."""
+    """Alternative health check endpoint."""
     return {"status": "ok", "uptime": int(time.time() - START_TIME)}
 
 
@@ -533,12 +682,12 @@ async def solve(request: Request, background_tasks: BackgroundTasks):
     secret = data.get("secret")
     
     if not url or not secret:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        raise HTTPException(status_code=400, detail="Missing url or secret")
     
     if secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
     
-    print("✅ Verified. Starting task...")
+    print(" Verified. Starting task...")
     
     # Clear state for new task
     URL_TIME.clear()
@@ -556,4 +705,5 @@ async def solve(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
+    print(f"\nStarting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
