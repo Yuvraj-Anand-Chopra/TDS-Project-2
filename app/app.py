@@ -11,6 +11,7 @@ Features:
 - 3-minute timeout handling
 - Error recovery
 - Background task execution
+- Model selection with best free tier quota (Gemini 2.0 Flash Lite - 30 RPM)
 """
 
 import os
@@ -319,24 +320,34 @@ TOOL_FUNCTIONS = {
 
 # ============================================================================
 # GEMINI MODEL INITIALIZATION - NO TOOLS AT INIT
+# Best Free Tier Quotas:
+# - gemini-2.0-flash-lite: 30 RPM (BEST)
+# - gemini-2.5-flash-lite: 15 RPM
+# - gemini-1.5-flash: 15 RPM
 # ============================================================================
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
-print("⚡ Initializing Gemini 2.0 Flash (without tools)...")
+print("⚡ Initializing Gemini 2.0 Flash Lite (30 RPM - Best Free Tier)...")
 try:
-    model = genai.GenerativeModel('gemini-2.5-flash-lite')
-    print("✅ Gemini 2.5 Flash initialized successfully!")
+    model = genai.GenerativeModel('gemini-2.0-flash-lite')
+    print("✅ Gemini 2.0 Flash Lite initialized successfully!")
 except Exception as e:
-    print(f"⚠️ Gemini 2.5 Flash failed: {e}")
-    print("⚡ Trying Gemini 2.0 Flash...")
+    print(f"⚠️ Gemini 2.0 Flash Lite failed: {e}")
+    print("⚡ Trying Gemini 2.5 Flash Lite (15 RPM)...")
     try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        print("✅ Gemini 2.0 Flash initialized successfully!")
+        model = genai.GenerativeModel('gemini-2.5-flash-lite')
+        print("✅ Gemini 2.5 Flash Lite initialized successfully!")
     except Exception as e2:
-        print(f"❌ Both models failed: {e2}")
-        logger.error(f"Failed to initialize Gemini model: {e2}")
-        model = None
+        print(f"⚠️ Gemini 2.5 Flash Lite failed: {e2}")
+        print("⚡ Trying Gemini 1.5 Flash (15 RPM - Fallback)...")
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            print("✅ Gemini 1.5 Flash initialized successfully!")
+        except Exception as e3:
+            print(f"❌ All models failed: {e3}")
+            logger.error(f"Failed to initialize any Gemini model: {e3}")
+            model = None
 
 if model is None:
     raise RuntimeError("Failed to initialize Gemini model. Check your API key.")
@@ -511,6 +522,7 @@ def root():
         "status": "ok",
         "uptime": int(time.time() - START_TIME),
         "service": "Quiz Solver",
+        "model": "Gemini (Auto-selected best free tier)",
         "timestamp": time.time()
     }
 
