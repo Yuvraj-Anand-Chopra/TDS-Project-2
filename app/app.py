@@ -7,7 +7,7 @@ Features:
 - Audio recognition (SpeechRecognition)
 - OCR (Tesseract)
 - Direct Gemini API with function calling
-- 7 essential tools
+- 9 essential tools
 - 3-minute timeout handling
 - Error recovery
 - Background task execution
@@ -22,7 +22,6 @@ import uuid
 import subprocess
 import logging
 import requests
-import base64
 from typing import Any, Dict, Optional, List
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -303,7 +302,7 @@ def pdf_to_image_tool(pdf_path: str, output_prefix: str = "page") -> str:
 
 
 # ============================================================================
-# TOOL MAPPING FOR GEMINI
+# TOOL MAPPING FOR GEMINI - CORRECTED SCHEMA
 # ============================================================================
 
 TOOL_FUNCTIONS = {
@@ -318,7 +317,7 @@ TOOL_FUNCTIONS = {
     "pdf_to_image_tool": pdf_to_image_tool,
 }
 
-# Gemini Tool Definitions
+# ✅ FIXED: Corrected Gemini Tool Definitions with proper schema
 TOOLS_DEFINITION = [
     {
         "name": "get_rendered_html",
@@ -364,7 +363,8 @@ TOOLS_DEFINITION = [
                 },
                 "payload": {
                     "type": "object",
-                    "description": "The JSON payload to send"
+                    "description": "The JSON payload to send",
+                    "properties": {}
                 }
             },
             "required": ["url", "payload"]
@@ -461,22 +461,34 @@ TOOLS_DEFINITION = [
 ]
 
 # ============================================================================
-# GEMINI MODEL INITIALIZATION
+# GEMINI MODEL INITIALIZATION - WITH ERROR HANDLING
 # ============================================================================
 
 genai.configure(api_key=GOOGLE_API_KEY)
 
+model = None
 try:
+    print("⚡ Initializing Gemini 2.0 Flash...")
     model = genai.GenerativeModel(
         model_name='gemini-2.0-flash-exp',
         tools=TOOLS_DEFINITION
     )
+    print("✅ Gemini 2.0 Flash initialized successfully!")
 except Exception as e:
-    logger.warning(f"⚠️ Primary model failed: {e}. Trying gemini-1.5-pro")
-    model = genai.GenerativeModel(
-        model_name='gemini-1.5-pro',
-        tools=TOOLS_DEFINITION
-    )
+    print(f"⚠️ Gemini 2.0 Flash failed: {e}")
+    try:
+        print("⚡ Trying Gemini 1.5 Pro...")
+        model = genai.GenerativeModel(
+            model_name='gemini-1.5-pro',
+            tools=TOOLS_DEFINITION
+        )
+        print("✅ Gemini 1.5 Pro initialized successfully!")
+    except Exception as e2:
+        print(f"❌ Both models failed: {e2}")
+        logger.error(f"Failed to initialize any Gemini model: {e2}")
+
+if model is None:
+    raise RuntimeError("Failed to initialize Gemini model. Check your API key and internet connection.")
 
 SYSTEM_PROMPT = f"""You are an autonomous quiz-solving agent with 9 specialized tools.
 
@@ -549,7 +561,7 @@ def run_agent(url: str):
         
         # Send initial message with URL
         initial_message = f"{SYSTEM_PROMPT}\n\nStart with this URL: {url}"
-        print(f"📢 Sending to Gemini:\n{initial_message}\n")
+        print(f"📢 Sending to Gemini:\n{initial_message[:300]}...\n")
         response = chat.send_message(initial_message)
         
         # Agent loop - continue until END or timeout
@@ -687,7 +699,7 @@ async def solve(request: Request, background_tasks: BackgroundTasks):
     if secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
     
-    print(" Verified. Starting task...")
+    print("✅ Verified. Starting task...")
     
     # Clear state for new task
     URL_TIME.clear()
@@ -705,5 +717,5 @@ async def solve(request: Request, background_tasks: BackgroundTasks):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
-    print(f"\nStarting server on port {port}...")
+    print(f"\n🚀 Starting server on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
