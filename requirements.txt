@@ -22,5 +22,4 @@ pytesseract==0.3.10
 
 playwright==1.40.0
 
-# Google Generative AI - Direct API (NO LangChain!)
 google-generativeai==0.8.3
