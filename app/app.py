@@ -1,5 +1,5 @@
 """
-AI-POWERED QUIZ SOLVER - PRODUCTION READY
+AI-POWERED QUIZ SOLVER - PRODUCTION READY - FIXED PARSER
 - Receives quiz URLs via POST /solve-quiz endpoint
 - Uses Gemini 2.0 Flash to intelligently solve any question type
 - Automatically submits answers back to server
@@ -197,11 +197,11 @@ TOOLS_MAP = {
 }
 
 # ============================================================================
-# TOOL PARSING - EXTRACT VALUES FROM GEMINI RESPONSES
+# FIXED PARSER - HANDLES DICTIONARY PAYLOADS CORRECTLY
 # ============================================================================
 
 def parse_tool_call(response_text: str) -> tuple:
-    """Parse Gemini's tool calls and extract actual parameter values."""
+    """Parse Gemini's tool calls - FIXED to handle dictionary payloads."""
     
     if "```" not in response_text:
         return None, None
@@ -212,7 +212,8 @@ def parse_tool_call(response_text: str) -> tuple:
     
     code = code_match.group(1).strip()
     
-    func_pattern = r'(\w+)\s*\((.*?)\)'
+    # Extract function call
+    func_pattern = r'(\w+)\s*\((.*)\)'
     matches = re.findall(func_pattern, code, re.DOTALL)
     
     if not matches:
@@ -223,15 +224,27 @@ def parse_tool_call(response_text: str) -> tuple:
     try:
         params = {}
         
-        # Priority 1: Extract quoted strings (ACTUAL VALUES)
-        quoted_params = re.findall(r'(\w+)\s*=\s*"([^"]*)"', params_str)
-        for key, val in quoted_params:
-            params[key] = val
+        # FIXED: Handle dictionary payloads with balanced braces
+        # First, extract payload dictionaries by matching balanced braces
+        dict_pattern = r'(\w+)\s*=\s*(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})'
+        for key, val in re.findall(dict_pattern, params_str):
+            try:
+                params[key] = json.loads(val)  # Parse as JSON dict
+                logger.info(f"✅ Parsed dict: {key}=<dict with {len(json.loads(val))} fields>")
+            except Exception as e:
+                logger.warning(f"Could not parse dict {key}: {e}")
+                params[key] = val  # Keep as string if not valid JSON
         
-        # Priority 2: Extract unquoted values
-        unquoted_params = re.findall(r'(\w+)\s*=\s*([^\s,\)]+)', params_str)
-        for key, val in unquoted_params:
-            if key not in params and not val.startswith('"'):
+        # Then, extract quoted strings (don't override dict values)
+        quoted_pattern = r'(\w+)\s*=\s*"([^"]*)"'
+        for key, val in re.findall(quoted_pattern, params_str):
+            if key not in params:
+                params[key] = val
+        
+        # Finally, extract other unquoted values (URLs, etc)
+        unquoted_pattern = r'(\w+)\s*=\s*([^\s,\)=]+)'
+        for key, val in re.findall(unquoted_pattern, params_str):
+            if key not in params and not val.startswith('"') and not val.startswith('{'):
                 params[key] = val.strip(',)')
         
         # Single positional argument
@@ -241,7 +254,7 @@ def parse_tool_call(response_text: str) -> tuple:
                 params['arg'] = single_quote.group(1)
         
         if params:
-            logger.info(f"✅ Parsed: {func_name}({params})")
+            logger.info(f"✅ Parsed: {func_name}({list(params.keys())})")
             return func_name, params
     
     except Exception as e:
@@ -255,14 +268,14 @@ def execute_tool(tool_name: str, params: dict) -> str:
         return f"Error: Unknown tool {tool_name}"
     
     try:
-        logger.info(f"🔧 Executing: {tool_name}({params})")
+        logger.info(f"🔧 Executing: {tool_name}")
         tool_func = TOOLS_MAP[tool_name]
         
         if 'arg' in params:
             result = tool_func(params['arg'])
         elif 'url' in params and 'payload' in params:
-            import json as json_module
-            payload = json_module.loads(params['payload']) if isinstance(params['payload'], str) else params['payload']
+            # Payload is already a dict (from JSON parsing)
+            payload = params['payload'] if isinstance(params['payload'], dict) else json.loads(params['payload'])
             result = tool_func(params['url'], payload)
         elif 'url' in params and 'filename' in params:
             result = tool_func(params['url'], params['filename'])
