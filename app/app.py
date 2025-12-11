@@ -1,15 +1,11 @@
 """
-TDS Project 2 - Enhanced LLM Analysis Quiz Solver
-Production-ready implementation with comprehensive error handling, token optimization,
-and full Project 2 requirements support.
+AI Quiz Solver - Project 2 Edition (FIXED)
 
-Key Features:
-- Autonomous quiz solving with multi-round support
-- Difficulty-aware retry strategies (Easy: 5 retries, Hard/Expert/Master: 2-3 retries)
-- Token optimization: deterministic code for math/data, LLM for NLP/vision
-- Full security: secret validation, no credential leakage
-- Comprehensive error handling with recovery strategies
-- Proper HTTP status codes (200/400/403)
+Enhanced FastAPI application for Project 2 with:
+- Proper quota detection and handling
+- Exponential backoff with API retry_delay extraction
+- Better next URL parsing
+- Graceful failure on quota exceeded
 """
 
 import os
@@ -17,14 +13,13 @@ import sys
 import json
 import time
 import base64
+import uuid
+import subprocess
 import logging
 import requests
 import re
-import subprocess
-import hashlib
-from typing import Any, Dict, Optional, Tuple, List
-from functools import wraps, lru_cache
-from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+from functools import wraps
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -32,647 +27,722 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import google.generativeai as genai
 from bs4 import BeautifulSoup
-import pandas as pd
-import numpy as np
 
-# ============================================================================
-# CONFIGURATION & SETUP
-# ============================================================================
-
+# Load environment variables
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# Environment Configuration
+# Configuration
 EMAIL = os.getenv("EMAIL", "")
 SECRET = os.getenv("SECRET", "")
+EXPECTED_SECRET = os.getenv("SECRET", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
-# Project Configuration
+# Project 2 specific configuration
 PROJECT_TYPE = "project2"
+INITIAL_URL = "https://tds-llm-analysis.s-anand.net/project2"
 SUBMIT_URL = "https://tds-llm-analysis.s-anand.net/submit"
-DEMO_URL = "https://tds-llm-analysis.s-anand.net/demo"
-PROJECT2_URL = "https://tds-llm-analysis.s-anand.net/project2"
 
-# Timeout and Retry Configuration
-TASK_TIMEOUT = 180  # 3 minutes per task
-TOTAL_QUIZ_TIMEOUT = 3600  # 1 hour total
-RETRY_LIMITS = {
-    1: 5,  # Easy
-    2: 5,  # Medium
-    3: 3,  # Hard
-    4: 3,  # Expert
-    5: 2   # Master
+# Difficulty levels mapping
+DIFFICULTY_LEVELS = {
+    1: {'name': 'Easy', 'next_url_always_shown': True, 'max_retries': 5},
+    2: {'name': 'Medium', 'next_url_always_shown': True, 'max_retries': 5},
+    3: {'name': 'Hard', 'next_url_always_shown': False, 'max_retries': 3},
+    4: {'name': 'Expert', 'next_url_always_shown': False, 'max_retries': 3},
+    5: {'name': 'Master', 'next_url_always_shown': False, 'max_retries': 2},
 }
 
-# Global State Management
+# Global stores
 BASE64_STORE = {}
-TASK_CACHE = {}
-SESSION_STATE = {}
+url_time = {}
+retry_cache = {}
+QUOTA_EXHAUSTED = False  # CRITICAL: Track if quota exceeded
+
+RETRY_LIMIT = 4
+TIMEOUT_LIMIT = 300
 
 # ============================================================================
-# VALIDATION & SECURITY
+# ERROR HANDLING & CLASSIFICATION
 # ============================================================================
 
-class SecurityValidator:
-    """Handles all security validation and credential protection."""
+class ErrorHandler:
+    """
+    Unified error classification and recovery strategy.
+    Distinguishes between rate_limit (temporary) and quota_exceeded (permanent).
+    """
     
-    @staticmethod
-    def validate_secret(provided_secret: str) -> bool:
-        """Validate secret against environment value."""
-        if not SECRET:
-            logger.error("SECRET not configured in environment")
-            return False
-        return provided_secret == SECRET
-    
-    @staticmethod
-    def validate_email(email: str) -> bool:
-        """Basic email validation."""
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return bool(re.match(pattern, email))
-    
-    @staticmethod
-    def validate_url(url: str) -> bool:
-        """Validate URL format."""
-        try:
-            result = re.match(r'https?://', url)
-            return bool(result)
-        except:
-            return False
-    
-    @staticmethod
-    def mask_sensitive(text: str, length: int = 10) -> str:
-        """Mask sensitive information in logs."""
-        if len(text) <= length:
-            return "***"
-        return text[:length//2] + "..." + text[-length//4:]
-
-# ============================================================================
-# ERROR HANDLING & RECOVERY
-# ============================================================================
-
-class ErrorClassifier:
-    """Intelligent error classification and recovery strategy selection."""
-    
-    ERROR_PATTERNS = {
-        '429': ('rate_limit', {'wait': 2, 'backoff': 'exponential', 'max_retries': 5}),
-        '403': ('auth', {'retry': False}),
-        '404': ('not_found', {'retry': False}),
-        '500': ('server_error', {'wait': 3, 'backoff': 'exponential', 'max_retries': 3}),
-        'timeout': ('timeout', {'wait': 2, 'backoff': 'exponential', 'max_retries': 3}),
-        'resource exhausted': ('quota', {'wait': 5, 'backoff': 'exponential', 'max_retries': 3}),
-        'connection': ('network', {'wait': 2, 'backoff': 'exponential', 'max_retries': 3}),
+    ERROR_TYPES = {
+        '429': 'rate_limit',
+        '403': 'auth',
+        '404': 'not_found',
+        'timeout': 'timeout',
+        'quota exceeded': 'quota_exceeded',
+        'Resource exhausted': 'quota_exceeded',
+        'limit: 0': 'quota_exceeded',
+        'Connection': 'connection_error',
+        'wrong': 'answer_incorrect',
     }
     
     @staticmethod
-    def classify(error: Exception) -> Tuple[str, dict]:
-        """Classify error and return recovery strategy."""
+    def classify_error(error: Exception) -> str:
+        """Classify the type of error that occurred."""
         error_str = str(error).lower()
         
-        for pattern, (error_type, strategy) in ErrorClassifier.ERROR_PATTERNS.items():
+        # Check for quota exhaustion FIRST (most critical)
+        if 'limit: 0' in error_str or ('quota exceeded' in error_str and 'limit: 0' in error_str):
+            return 'quota_exceeded'
+        if 'quota exceeded' in error_str and 'daily' in error_str:
+            return 'quota_exceeded'
+            
+        for pattern, error_type in ErrorHandler.ERROR_TYPES.items():
             if pattern.lower() in error_str:
                 logger.info(f"Error classified as: {error_type}")
-                return error_type, strategy
+                return error_type
         
-        return 'unknown', {'retry': True, 'wait': 1, 'max_retries': 2}
+        return 'unknown'
+    
+    @staticmethod
+    def get_retry_delay(error: Exception) -> Optional[int]:
+        """Extract retry_delay from API error response."""
+        error_str = str(error)
+        
+        # Look for "retry_delay { seconds: XX }"
+        match = re.search(r'seconds:\s*(\d+)', error_str)
+        if match:
+            delay = int(match.group(1))
+            logger.info(f"API suggests retry after {delay} seconds")
+            return delay
+        
+        return None
+    
+    @staticmethod
+    def get_recovery_strategy(error_type: str) -> dict:
+        """Get the recovery strategy for a specific error type."""
+        strategies = {
+            'quota_exceeded': {
+                'retry': False,
+                'action': 'fail_fast',
+                'log': 'critical',
+                'reason': 'Daily quota exhausted - cannot proceed'
+            },
+            'rate_limit': {
+                'retry': True,
+                'wait': 2,
+                'backoff': 'exponential',
+                'max_retries': 3,
+                'action': 'exponential_backoff'
+            },
+            'parser_error': {
+                'retry': True,
+                'wait': 1,
+                'action': 'restructure_input',
+                'max_retries': 2,
+                'backoff': 'linear'
+            },
+            'timeout': {
+                'retry': True,
+                'wait': 2,
+                'backoff': 'exponential',
+                'max_retries': 2,
+                'action': 'retry_with_delay'
+            },
+            'answer_incorrect': {
+                'retry': True,
+                'wait': 1,
+                'action': 'retry_different_approach',
+                'max_retries': 2,
+                'backoff': 'none'
+            },
+            'auth': {
+                'retry': False,
+                'action': 'fail_fast',
+                'log': 'critical'
+            },
+        }
+        return strategies.get(error_type, {'retry': False})
 
-def retry_with_backoff(max_attempts: int = 3, backoff_factor: float = 2.0):
-    """Decorator for exponential backoff retry logic."""
+
+# ============================================================================
+# IMPROVED RATE LIMITING DECORATOR WITH QUOTA DETECTION
+# ============================================================================
+
+def rate_limit_aware(max_retries: int = 3):
+    """
+    Decorator that handles rate limiting with exponential backoff.
+    CRITICAL: Detects quota_exceeded and fails fast.
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            attempt = 0
+            global QUOTA_EXHAUSTED
+            
             wait_time = 1
             
-            while attempt < max_attempts:
+            for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
+                
                 except Exception as e:
-                    attempt += 1
-                    error_type, strategy = ErrorClassifier.classify(e)
+                    error_type = ErrorHandler.classify_error(e)
                     
-                    if not strategy.get('retry', False) or attempt >= max_attempts:
+                    # CRITICAL: Quota exhausted = permanent failure
+                    if error_type == 'quota_exceeded':
+                        QUOTA_EXHAUSTED = True
+                        logger.error("⚠️  QUOTA EXHAUSTED - Cannot proceed")
+                        logger.error(f"   Reason: {str(e)[:200]}")
                         raise
                     
-                    wait_time = strategy.get('wait', 1)
-                    if strategy.get('backoff') == 'exponential':
-                        wait_time = wait_time * (backoff_factor ** (attempt - 1))
+                    # Rate limit = temporary, apply backoff
+                    if error_type == 'rate_limit':
+                        # Check if API suggests retry delay
+                        api_delay = ErrorHandler.get_retry_delay(e)
+                        if api_delay:
+                            wait_time = api_delay
+                        
+                        logger.warning(f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                        time.sleep(wait_time)
+                        wait_time = min(wait_time * 2, 32)  # Exponential backoff up to 32s
+                        
+                        if attempt < max_retries - 1:
+                            continue
                     
-                    logger.warning(f"Attempt {attempt}/{max_attempts} failed. "
-                                 f"Waiting {wait_time:.1f}s before retry...")
-                    time.sleep(wait_time)
+                    raise
         
         return wrapper
     return decorator
 
+
 # ============================================================================
-# CONTENT ANALYSIS & TASK UNDERSTANDING
+# ENHANCED CONTENT ANALYZER
 # ============================================================================
 
-class TaskAnalyzer:
-    """Analyzes task HTML to extract metadata and requirements."""
+class ContentAnalyzer:
+    """
+    Analyzes HTML content to understand task requirements.
+    Enhanced for Project 2 to detect difficulty, format, and personalization.
+    """
     
     @staticmethod
-    def extract_text(html: str) -> str:
-        """Extract clean text from HTML."""
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
-            return soup.get_text(strip=True)
-        except Exception as e:
-            logger.error(f"Text extraction failed: {e}")
-            return ""
-    
-    @staticmethod
-    def detect_difficulty(html: str) -> int:
-        """Detect task difficulty level (1-5)."""
-        for level in range(5, 0, -1):  # Check 5 down to 1
+    def extract_difficulty_level(html: str) -> int:
+        """Extract difficulty level from HTML (1-5)."""
+        for level in range(1, 6):
             patterns = [
                 f"Difficulty {level}",
-                f"LEVEL {level}",
-                f"difficulty-{level}",
-                f"level-{level}",
-                f"Difficulty: {level}",
+                f"difficulty {level}",
+                f"DIFFICULTY {level}",
+                f"Level {level}",
             ]
             for pattern in patterns:
                 if pattern in html:
-                    logger.info(f"Difficulty detected: Level {level}")
+                    logger.info(f"Difficulty level detected: {level}")
                     return level
         return 1  # Default to Easy
     
     @staticmethod
-    def detect_answer_format(html: str) -> str:
-        """Detect required answer format from task description."""
+    def extract_format_requirement(html: str) -> str:
+        """Extract required answer format from task page."""
         patterns = [
-            r'answer\s+(?:as|in|format):\s*([^\n.]+)',
-            r'required\s+format:\s*([^\n.]+)',
-            r'submit\s+(?:as|in|format):\s*([^\n.]+)',
-            r'format:\s*([^\n.]+)',
+            r'answer\s+as\s+([^\.\:\n]+)',
+            r'required\s+format[:\s]+([^\.\:\n]+)',
+            r'format:\s*([^\.\:\n]+)',
+            r'submit\s+as\s+([^\.\:\n]+)',
         ]
-        
         for pattern in patterns:
             match = re.search(pattern, html, re.IGNORECASE)
             if match:
-                fmt = match.group(1).strip()
-                logger.info(f"Answer format detected: {fmt}")
-                return fmt
-        
-        return "string"  # Default
+                format_str = match.group(1).strip()
+                logger.info(f"Answer format detected: {format_str}")
+                return format_str
+        return "unknown"
     
     @staticmethod
-    def detect_personalization(html: str) -> Tuple[bool, str]:
-        """Check if task is personalized to the student's email."""
-        if "Not personalized" in html or "not personalized" in html:
-            return False, "Universal answer (same for all students)"
-        
-        if EMAIL and EMAIL in html:
-            return True, f"Personalized to {EMAIL}"
-        
-        # Check for generic email pattern
-        if re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html):
-            return True, "Email-specific personalization detected"
-        
-        return False, "No personalization detected"
-    
-    @staticmethod
-    def extract_urls(text: str) -> List[str]:
-        """Extract all URLs from text."""
-        pattern = r'https?://[^\s"\'\)<>\[\]{}]+'
-        urls = re.findall(pattern, text)
-        return list(set(urls))  # Remove duplicates
-    
-    @staticmethod
-    def analyze_task(html: str) -> Dict[str, Any]:
-        """Comprehensive task analysis."""
-        text = TaskAnalyzer.extract_text(html)
-        
-        analysis = {
-            'difficulty': TaskAnalyzer.detect_difficulty(html),
-            'answer_format': TaskAnalyzer.detect_answer_format(html),
-            'personalized': TaskAnalyzer.detect_personalization(html)[0],
-            'personalization_note': TaskAnalyzer.detect_personalization(html)[1],
-            'urls': TaskAnalyzer.extract_urls(html),
-            'task_type': TaskAnalyzer.infer_task_type(text),
-            'length': len(text),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        logger.info(f"Task Analysis: Difficulty={analysis['difficulty']}, "
-                   f"Format={analysis['answer_format']}, "
-                   f"Personalized={analysis['personalized']}")
-        
-        return analysis
-    
-    @staticmethod
-    def infer_task_type(text: str) -> str:
-        """Infer task type from text."""
-        text_lower = text.lower()
-        
-        if any(word in text_lower for word in ['download', 'scrape', 'extract', 'url']):
-            return 'web_scraping'
-        elif any(word in text_lower for word in ['sum', 'total', 'calculate', 'add']):
-            return 'calculation'
-        elif any(word in text_lower for word in ['count', 'how many', 'number of']):
-            return 'counting'
-        elif any(word in text_lower for word in ['csv', 'excel', 'dataframe', 'column']):
-            return 'data_analysis'
-        elif any(word in text_lower for word in ['image', 'picture', 'chart', 'graph', 'plot']):
-            return 'image_analysis'
-        elif any(word in text_lower for word in ['pdf', 'document', 'page']):
-            return 'pdf_parsing'
-        elif any(word in text_lower for word in ['api', 'endpoint', 'request']):
-            return 'api_call'
-        else:
-            return 'unknown'
-
-# ============================================================================
-# TOOL IMPLEMENTATIONS (Token-Optimized)
-# ============================================================================
-
-class ToolExecutor:
-    """Executes tools with proper error handling and caching."""
-    
-    @staticmethod
-    @retry_with_backoff(max_attempts=3)
-    def fetch_url(url: str) -> str:
-        """Fetch HTML from URL with caching."""
-        if url in TASK_CACHE:
-            logger.info(f"Using cached content for {url}")
-            return TASK_CACHE[url]
-        
-        logger.info(f"Fetching: {url}")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                         "AppleWebKit/537.36"
-        }
-        
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
-        
-        content = response.text[:300000]  # Limit size
-        TASK_CACHE[url] = content
-        logger.info(f"Retrieved {len(content)} bytes from {url}")
-        
-        return content
-    
-    @staticmethod
-    def submit_answer(url: str, email: str, secret: str, answer: Any) -> Dict:
-        """Submit answer to quiz server."""
-        payload = {
-            "email": email,
-            "secret": secret,
-            "url": url,
-            "answer": answer
-        }
-        
-        logger.info(f"Submitting answer to {url}")
-        logger.debug(f"Payload keys: {list(payload.keys())}")
-        
-        try:
-            response = requests.post(url, json=payload, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            logger.info(f"Server response: {json.dumps(data, indent=2)}")
-            
-            return data
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Submission failed: {e}")
-            raise
-    
-    @staticmethod
-    def execute_code(code: str) -> str:
-        """Execute Python code safely with timeout."""
-        logger.info("Executing Python code")
-        
-        os.makedirs("LLMFiles", exist_ok=True)
-        filepath = os.path.join("LLMFiles", f"code_{int(time.time())}.py")
-        
-        try:
-            with open(filepath, 'w') as f:
-                f.write(code)
-            
-            result = subprocess.run(
-                [sys.executable, filepath],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            output = result.stdout + (f"\n[STDERR]\n{result.stderr}" if result.stderr else "")
-            logger.info(f"Code execution output: {output[:500]}")
-            
-            return output or "Code executed successfully"
-        
-        except subprocess.TimeoutExpired:
-            logger.error("Code execution timeout")
-            return "Error: Code execution timeout (>30s)"
-        except Exception as e:
-            logger.error(f"Code execution error: {e}")
-            return f"Error: {str(e)}"
-    
-    @staticmethod
-    def download_file(url: str, filename: str) -> str:
-        """Download file with progress logging."""
-        logger.info(f"Downloading {filename} from {url}")
-        
-        try:
-            response = requests.get(url, timeout=60, stream=True)
-            response.raise_for_status()
-            
-            os.makedirs("LLMFiles", exist_ok=True)
-            filepath = os.path.join("LLMFiles", filename)
-            
-            total_size = 0
-            with open(filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        total_size += len(chunk)
-            
-            logger.info(f"Downloaded {total_size} bytes to {filepath}")
-            return filepath
-        
-        except Exception as e:
-            logger.error(f"Download failed: {e}")
-            raise
-
-# ============================================================================
-# LLM INTEGRATION (Token-Optimized)
-# ============================================================================
-
-class GeminiSolver:
-    """Manages Gemini API calls with token optimization."""
-    
-    MODEL_PRIORITY = [
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-    ]
-    
-    def __init__(self):
-        self.model = None
-        self.initialize_model()
-    
-    def initialize_model(self):
-        """Initialize Gemini model with fallback."""
-        genai.configure(api_key=GOOGLE_API_KEY)
-        
-        for model_name in self.MODEL_PRIORITY:
-            try:
-                self.model = genai.GenerativeModel(model_name)
-                logger.info(f"Initialized: {model_name}")
-                return
-            except Exception as e:
-                logger.warning(f"Failed to load {model_name}: {e}")
-        
-        raise RuntimeError("Could not initialize any Gemini model")
-    
-    @retry_with_backoff(max_attempts=5)
-    def solve(self, task_html: str, task_analysis: Dict[str, Any]) -> str:
-        """
-        Solve task using Gemini with token optimization.
-        
-        Token strategy:
-        - Use analysis metadata to guide approach
-        - For deterministic tasks: suggest Python code (0 tokens)
-        - For NLP tasks: use LLM
-        """
-        
-        task_type = task_analysis['task_type']
-        difficulty = task_analysis['difficulty']
-        
-        # Build optimized prompt
-        prompt = self._build_prompt(task_html, task_analysis)
-        
-        logger.info(f"Calling Gemini for {task_type} task (difficulty {difficulty})")
-        
-        try:
-            response = self.model.generate_content(prompt)
-            
-            if not response or not response.text:
-                raise ValueError("Empty response from Gemini")
-            
-            return response.text
-        
-        except Exception as e:
-            error_type, _ = ErrorClassifier.classify(e)
-            logger.error(f"Gemini error ({error_type}): {e}")
-            raise
-    
-    @staticmethod
-    def _build_prompt(html: str, analysis: Dict[str, Any]) -> str:
-        """Build token-optimized prompt."""
-        
-        task_type = analysis['task_type']
-        difficulty = analysis['difficulty']
-        answer_format = analysis['answer_format']
-        
-        base_prompt = f"""You are an expert data science quiz solver.
-
-TASK METADATA:
-- Difficulty: {difficulty}/5
-- Task Type: {task_type}
-- Required Answer Format: {answer_format}
-- Personalized: {analysis['personalized']}
-
-TASK HTML:
-{html[:5000]}
-
-INSTRUCTIONS:
-1. Analyze the task carefully
-2. Determine the exact requirement
-3. For data analysis: write Python code using pandas/numpy
-4. For web tasks: extract and parse content
-5. Format your answer EXACTLY as: ANSWER: [your_answer_here]
-
-CRITICAL:
-- Answer format MUST be exactly: {answer_format}
-- Double-check your calculation
-- Format matters for grading"""
-        
-        return base_prompt
-
-# ============================================================================
-# MAIN QUIZ SOLVER
-# ============================================================================
-
-class QuizSolver:
-    """Main quiz solving orchestrator with full Project 2 support."""
-    
-    def __init__(self, email: str, secret: str, initial_url: str):
-        self.email = email
-        self.secret = secret
-        self.current_url = initial_url
-        self.solver = GeminiSolver()
-        self.task_count = 0
-        self.start_time = time.time()
-        self.task_results = []
-    
-    def run(self) -> Dict[str, Any]:
-        """Execute the complete quiz chain."""
-        logger.info(f"Starting quiz solver for {self.email}")
-        
-        try:
-            while self.should_continue():
-                self.solve_current_task()
-            
-            return self.get_summary()
-        
-        except Exception as e:
-            logger.error(f"Quiz solver error: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'tasks_completed': self.task_count,
-                'elapsed_seconds': time.time() - self.start_time
-            }
-    
-    def should_continue(self) -> bool:
-        """Check if should continue solving."""
-        elapsed = time.time() - self.start_time
-        
-        if elapsed > TOTAL_QUIZ_TIMEOUT:
-            logger.warning("Total quiz timeout reached")
-            return False
-        
-        if self.task_count > 50:  # Safety limit
-            logger.warning("Maximum task limit reached")
-            return False
-        
-        return True
-    
-    def solve_current_task(self):
-        """Solve the current task."""
-        self.task_count += 1
-        task_start = time.time()
-        
-        logger.info(f"\n{'='*80}")
-        logger.info(f"TASK {self.task_count}: {self.current_url}")
-        logger.info(f"{'='*80}\n")
-        
-        try:
-            # Fetch task
-            html = ToolExecutor.fetch_url(self.current_url)
-            
-            # Analyze task
-            analysis = TaskAnalyzer.analyze_task(html)
-            difficulty = analysis['difficulty']
-            
-            # Solve task
-            solution = self.solver.solve(html, analysis)
-            
-            # Extract answer
-            answer = self._extract_answer(solution, analysis['answer_format'])
-            
-            # Submit answer
-            response = ToolExecutor.submit_answer(
-                SUBMIT_URL, self.email, self.secret, answer
-            )
-            
-            is_correct = response.get('correct', False)
-            next_url = response.get('url')
-            reason = response.get('reason', '')
-            
-            # Store result
-            self.task_results.append({
-                'task': self.task_count,
-                'url': self.current_url,
-                'difficulty': difficulty,
-                'correct': is_correct,
-                'answer': str(answer)[:100],
-                'reason': reason,
-                'elapsed': time.time() - task_start
-            })
-            
-            if is_correct:
-                logger.info(f"✓ Task {self.task_count} CORRECT")
-                
-                if next_url:
-                    self.current_url = next_url
-                    logger.info(f"Next URL: {next_url}")
-                else:
-                    logger.info("Quiz complete!")
-                    self.current_url = None
-            
-            else:
-                logger.warning(f"✗ Task {self.task_count} INCORRECT: {reason}")
-                
-                # Retry logic based on difficulty
-                if self._should_retry(difficulty):
-                    logger.info(f"Retrying task {self.task_count}...")
-                else:
-                    logger.info(f"Max retries reached for difficulty {difficulty}")
-                    self.current_url = None
-        
-        except Exception as e:
-            logger.error(f"Task {self.task_count} error: {e}")
-            self.current_url = None
-    
-    def _extract_answer(self, solution: str, format_hint: str) -> Any:
-        """Extract answer from solution text."""
-        # Look for ANSWER: pattern
-        match = re.search(r'ANSWER:\s*(.+?)(?:\n|$)', solution, re.IGNORECASE)
-        
-        if match:
-            answer_str = match.group(1).strip()
-        else:
-            # Fallback: take last sentence
-            lines = [l.strip() for l in solution.split('\n') if l.strip()]
-            answer_str = lines[-1] if lines else ""
-        
-        # Try to convert based on format hint
-        if 'int' in format_hint.lower():
-            try:
-                return int(answer_str)
-            except:
-                pass
-        
-        elif 'float' in format_hint.lower():
-            try:
-                return float(answer_str)
-            except:
-                pass
-        
-        elif 'bool' in format_hint.lower():
-            return answer_str.lower() in ['true', 'yes', '1']
-        
-        return answer_str
-    
-    def _should_retry(self, difficulty: int) -> bool:
-        """Check if should retry based on difficulty."""
-        max_retries = RETRY_LIMITS.get(difficulty, 2)
-        # Simplified: just check if we have attempts left
-        return self.task_count < max_retries * 2
-    
-    def get_summary(self) -> Dict[str, Any]:
-        """Get quiz solving summary."""
-        correct_count = sum(1 for r in self.task_results if r['correct'])
+    def analyze_task(html: str) -> dict:
+        """Comprehensive task analysis for Project 2."""
+        difficulty = ContentAnalyzer.extract_difficulty_level(html)
+        format_req = ContentAnalyzer.extract_format_requirement(html)
         
         return {
-            'status': 'completed',
-            'tasks_completed': self.task_count,
-            'tasks_correct': correct_count,
-            'tasks_incorrect': self.task_count - correct_count,
-            'success_rate': correct_count / self.task_count if self.task_count > 0 else 0,
-            'elapsed_seconds': time.time() - self.start_time,
-            'results': self.task_results
+            'difficulty': difficulty,
+            'difficulty_name': DIFFICULTY_LEVELS.get(difficulty, {}).get('name', 'Unknown'),
+            'format': format_req,
         }
 
+
 # ============================================================================
-# FASTAPI APPLICATION
+# IMPROVED URL PARSER WITH BETTER NEXT_URL EXTRACTION
 # ============================================================================
 
-app = FastAPI(
-    title="TDS Project 2 - LLM Analysis Quiz Solver",
-    description="Autonomous AI-powered quiz solving system",
-    version="2.0.0"
-)
+def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
+    """
+    Parse Gemini's tool calls from response text.
+    IMPROVED: Better boundary detection and parameter extraction.
+    """
+    if "```" not in response_text:
+        return None, None
+    
+    code_match = re.search(r'```(?:python|tool_code)?\s*(.*?)```', response_text, re.DOTALL)
+    if not code_match:
+        return None, None
+    
+    code = code_match.group(1).strip()
+    func_pattern = r'^(\w+)\s*\((.*)?\)$'
+    
+    matches = re.findall(func_pattern, code, re.MULTILINE | re.DOTALL)
+    if not matches:
+        return None, None
+    
+    func_name, params_str = matches[0]
+    if params_str is None:
+        params_str = ""
+    
+    params = {}
+    
+    try:
+        # Extract quoted strings
+        quoted_pattern = r'(\w+)\s*=\s*"([^"]*)"'
+        for key, val in re.findall(quoted_pattern, params_str):
+            params[key] = val
+        
+        # Extract dictionary payloads
+        dict_pattern = r'(\w+)\s*=\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
+        for key, val in re.findall(dict_pattern, params_str):
+            try:
+                params[key] = json.loads(val)
+            except:
+                params[key] = val
+        
+        # Extract unquoted values
+        unquoted_pattern = r'(\w+)\s*=\s*([^\s,\)=]+)(?![\w&])'
+        for key, val in re.findall(unquoted_pattern, params_str):
+            if key not in params and not val.startswith('"') and not val.startswith('{'):
+                params[key] = val.strip(',)')
+        
+        if params:
+            logger.info(f"Parsed: {func_name}({list(params.keys())})")
+        
+        return func_name, params
+    
+    except Exception as e:
+        logger.error(f"Parse error: {e}")
+        return None, None
+
+
+def extract_next_url(response_text: str, current_url: str) -> Optional[str]:
+    """
+    IMPROVED: Extract next URL from Gemini response with better pattern matching.
+    Tries multiple extraction strategies.
+    """
+    
+    # Strategy 1: Look for direct "next_url" or "nextUrl"
+    patterns = [
+        r'next_url["\']?\s*[:=]\s*["\']?(https?://[^\s"\']+)',
+        r'nextUrl["\']?\s*[:=]\s*["\']?(https?://[^\s"\']+)',
+        r'next URL is[:\s]+["\']?(https?://[^\s"\']+)',
+        r'continuing to[:\s]+["\']?(https?://[^\s"\']+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            url = match.group(1).strip('"\'')
+            if url != current_url and 'http' in url:
+                logger.info(f"Next URL extracted: {url}")
+                return url
+    
+    # Strategy 2: Find ALL URLs and return the last one that's different
+    all_urls = re.findall(r'https?://[^\s"\')\]]+', response_text)
+    
+    if all_urls:
+        # Filter for valid next URLs
+        valid_urls = [u for u in all_urls if u != current_url and 'tds-llm' in u]
+        if valid_urls:
+            next_url = valid_urls[-1]
+            logger.info(f"Next URL extracted (from URL list): {next_url}")
+            return next_url
+    
+    logger.warning("Could not extract next URL from response")
+    return None
+
+
+# ============================================================================
+# TOOL IMPLEMENTATIONS
+# ============================================================================
+
+def get_rendered_html(url: str) -> str:
+    """Fetch rendered HTML content from a given URL."""
+    try:
+        logger.info(f"Fetching URL: {url}")
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        content = response.text[:200000]
+        logger.info(f"Retrieved {len(content)} characters")
+        return content
+    except Exception as e:
+        logger.error(f"Error fetching URL: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+def post_request(url: str, payload: Dict[str, Any]) -> str:
+    """Submit an answer to the quiz server via POST request."""
+    try:
+        logger.info(f"Posting answer to: {url}")
+        
+        if isinstance(payload.get("answer"), str) and payload["answer"].startswith("BASE64_KEY:"):
+            key = payload["answer"].split(":", 1)[1]
+            if key in BASE64_STORE:
+                payload["answer"] = BASE64_STORE[key]
+        
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        
+        is_correct = data.get("correct", False)
+        if is_correct:
+            logger.info("✅ Answer is correct")
+        else:
+            logger.warning(f"❌ Answer is incorrect: {data.get('reason', 'Unknown')}")
+        
+        return json.dumps(data)
+    
+    except Exception as e:
+        logger.error(f"POST Error: {str(e)}")
+        return json.dumps({"error": str(e)})
+
+
+def run_code(code: str) -> str:
+    """Execute Python code in a subprocess."""
+    try:
+        logger.info("Executing Python code")
+        os.makedirs("LLMFiles", exist_ok=True)
+        temp_file = os.path.join("LLMFiles", "runner.py")
+        
+        with open(temp_file, "w") as f:
+            f.write(code)
+        
+        proc = subprocess.Popen(
+            [sys.executable, temp_file],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        stdout, stderr = proc.communicate(timeout=30)
+        result = (stdout + ("\nErrors:\n" + stderr if stderr else ""))[:3000]
+        logger.info(f"Code executed: {result[:200]}")
+        
+        return result or "Executed"
+    
+    except Exception as e:
+        logger.error(f"Code execution error: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+def download_file(url: str, filename: str) -> str:
+    """Download a file from a URL and save it locally."""
+    try:
+        logger.info(f"Downloading {filename} from {url}")
+        response = requests.get(url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        os.makedirs("LLMFiles", exist_ok=True)
+        filepath = os.path.join("LLMFiles", filename)
+        
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(8192):
+                if chunk:
+                    f.write(chunk)
+        
+        logger.info(f"File saved to {filepath}")
+        return f"Saved: {filepath}"
+    
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+def encode_image_to_base64(image_path: str) -> str:
+    """Convert an image file to base64 encoding."""
+    try:
+        if not image_path.startswith("LLMFiles"):
+            image_path = os.path.join("LLMFiles", image_path)
+        
+        with open(image_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        
+        key = str(uuid.uuid4())
+        BASE64_STORE[key] = encoded
+        logger.info(f"Image encoded, key: {key[:8]}")
+        
+        return f"BASE64_KEY:{key}"
+    
+    except Exception as e:
+        logger.error(f"Image encoding error: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+def add_dependencies(package_name: str) -> str:
+    """Install a Python package using pip."""
+    try:
+        if package_name in ["hashlib", "math", "json", "os", "sys", "re"]:
+            return "Built-in"
+        
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package_name, "-q"])
+        logger.info(f"Installed {package_name}")
+        
+        return f"Installed {package_name}"
+    
+    except Exception as e:
+        logger.error(f"Package install error: {str(e)}")
+        return f"Error: {str(e)}"
+
+
+TOOLS_MAP = {
+    "get_rendered_html": get_rendered_html,
+    "post_request": post_request,
+    "run_code": run_code,
+    "download_file": download_file,
+    "encode_image_to_base64": encode_image_to_base64,
+    "add_dependencies": add_dependencies,
+}
+
+
+def execute_tool(tool_name: str, params: dict) -> str:
+    """Execute a tool with the parsed parameters."""
+    if tool_name not in TOOLS_MAP:
+        return f"Error: Unknown tool {tool_name}"
+    
+    try:
+        logger.info(f"Executing tool: {tool_name}")
+        tool_func = TOOLS_MAP[tool_name]
+        
+        if 'arg' in params:
+            result = tool_func(params['arg'])
+        elif 'url' in params and 'payload' in params:
+            payload = params['payload'] if isinstance(params['payload'], dict) else json.loads(params['payload'])
+            result = tool_func(params['url'], payload)
+        elif 'url' in params and 'filename' in params:
+            result = tool_func(params['url'], params['filename'])
+        elif 'image_path' in params:
+            result = tool_func(params['image_path'])
+        elif 'package_name' in params:
+            result = tool_func(params['package_name'])
+        elif 'code' in params:
+            result = tool_func(params['code'])
+        else:
+            result = tool_func(**params)
+        
+        logger.info(f"Tool result: {str(result)[:300]}")
+        return str(result)
+    
+    except Exception as e:
+        error_type = ErrorHandler.classify_error(e)
+        logger.error(f"Execution error ({error_type}): {e}")
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
+# GEMINI MODEL INITIALIZATION
+# ============================================================================
+
+logger.info("Initializing Gemini API...")
+try:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash-lite")
+    logger.info("✅ Gemini 2.0 Flash Lite initialized")
+except Exception as e:
+    logger.warning(f"Gemini 2.0 Flash failed: {e}")
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        logger.info("✅ Gemini 1.5 Flash initialized (fallback)")
+    except Exception as e2:
+        logger.error(f"❌ Model initialization failed: {e2}")
+        model = None
+
+
+# ============================================================================
+# AUTONOMOUS QUIZ SOLVER AGENT
+# ============================================================================
+
+@rate_limit_aware(max_retries=3)
+def ask_gemini_with_rate_limit(messages: list) -> str:
+    """Ask Gemini a question with built-in rate limit handling."""
+    global QUOTA_EXHAUSTED
+    
+    if QUOTA_EXHAUSTED:
+        raise RuntimeError("Quota exhausted - cannot call Gemini API")
+    
+    if not model:
+        raise RuntimeError("Gemini model not initialized")
+    
+    response = model.generate_content(messages, stream=False)
+    return response.text if response else ""
+
+
+def run_agent(url: str):
+    """
+    Main agent loop for solving Project 2 quiz questions.
+    IMPROVED: Detects quota exhaustion and fails fast.
+    """
+    global QUOTA_EXHAUSTED
+    
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Starting Project 2 quiz solver for: {url}")
+    logger.info(f"{'='*80}\n")
+    
+    current_url = url
+    iteration = 0
+    max_iterations = 50
+    message_history = []
+    task_attempts = {}
+    
+    SYSTEM_PROMPT = (
+        "You are an expert PROJECT 2 SOLVER.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Difficulty 1-2: Next URL always shown (even if wrong)\n"
+        "2. Difficulty 3-5: Next URL ONLY if answer is CORRECT\n"
+        "3. Read answer format requirement CAREFULLY\n"
+        "4. Check if task is personalized or not\n"
+        "5. Solve correctly on difficulties 3-5 or you get stuck\n\n"
+        "WORKFLOW:\n"
+        "1. Call get_rendered_html to fetch the task page\n"
+        "2. READ the task carefully\n"
+        "3. Identify: difficulty, format requirement, personalization\n"
+        "4. Solve the problem CORRECTLY\n"
+        "5. Format answer exactly as required\n"
+        "6. POST to https://tds-llm-analysis.s-anand.net/submit\n"
+        "7. Continue until all tasks completed\n\n"
+        f"YOUR CREDENTIALS:\n"
+        f"Email: {EMAIL}\n"
+        f"Secret: {SECRET}\n"
+        f"Submit to: {SUBMIT_URL}\n\n"
+        "Available tools: get_rendered_html, post_request, run_code"
+    )
+    
+    try:
+        while iteration < max_iterations:
+            iteration += 1
+            
+            if QUOTA_EXHAUSTED:
+                logger.error("⚠️  QUOTA EXHAUSTED - Stopping agent")
+                break
+            
+            logger.info(f"\n{'='*80}")
+            logger.info(f"ITERATION {iteration} | URL: {current_url}")
+            logger.info(f"{'='*80}\n")
+            
+            attempts = task_attempts.get(current_url, 0)
+            if attempts > 0:
+                logger.info(f"Attempt {attempts + 1} for this task\n")
+            
+            # Build prompt
+            if iteration == 1:
+                prompt = (
+                    f"{SYSTEM_PROMPT}\n\n"
+                    f"START: You are beginning Project 2.\n"
+                    f"First URL: {current_url}\n\n"
+                    f"Fetch this URL, analyze the task, solve it, "
+                    f"and POST your answer with ALL fields: email, secret, url, answer."
+                )
+            else:
+                prompt = (
+                    f"Continue to next task.\n"
+                    f"URL: {current_url}\n\n"
+                    f"Fetch the page, analyze, solve it, "
+                    f"and POST with email, secret, url, answer.\n"
+                    f"Format your answer EXACTLY as specified."
+                )
+            
+            message_history.append({"role": "user", "content": prompt})
+            
+            logger.info("Calling Gemini...\n")
+            
+            try:
+                text = ask_gemini_with_rate_limit(
+                    [{"role": msg["role"], "parts": [msg["content"]]} for msg in message_history]
+                )
+            
+            except Exception as e:
+                error_type = ErrorHandler.classify_error(e)
+                
+                if error_type == 'quota_exceeded':
+                    QUOTA_EXHAUSTED = True
+                    logger.error(f"⚠️  QUOTA EXHAUSTED: {str(e)[:200]}")
+                    break
+                
+                logger.error(f"Gemini error ({error_type}): {e}")
+                message_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
+                continue
+            
+            if not text:
+                logger.warning("No response from model")
+                continue
+            
+            logger.info(f"Gemini response ({len(text)} chars):\n{text[:600]}\n")
+            
+            # Parse tool call
+            tool_name, params = parse_tool_call(text)
+            
+            if tool_name:
+                logger.info(f"Tool call detected: {tool_name}\n")
+                tool_result = execute_tool(tool_name, params)
+                
+                # Analyze if HTML
+                if tool_name == 'get_rendered_html' and "Error" not in tool_result:
+                    analysis = ContentAnalyzer.analyze_task(tool_result)
+                    logger.info(f"Task Analysis: Difficulty={analysis['difficulty']}, Format={analysis['format']}\n")
+                
+                message_history.append({"role": "assistant", "content": text})
+                message_history.append({
+                    "role": "user",
+                    "content": f"Tool {tool_name} result:\n{tool_result}\n\nBased on this, solve and POST your answer."
+                })
+                
+                # Trim history
+                if len(message_history) > 20:
+                    message_history = message_history[:2] + message_history[-15:]
+                
+                continue
+            
+            message_history.append({"role": "assistant", "content": text})
+            
+            # Check for completion
+            if "END" in text or "complete" in text.lower() or "all tasks" in text.lower():
+                logger.info("✅ Quiz marked complete by Gemini")
+                break
+            
+            # Track attempts
+            if current_url not in task_attempts:
+                task_attempts[current_url] = 0
+            task_attempts[current_url] += 1
+            
+            # Extract next URL
+            next_url = extract_next_url(text, current_url)
+            
+            if next_url and next_url != current_url:
+                current_url = next_url
+                task_attempts[current_url] = 0
+                logger.info(f"Moving to next task: {current_url}\n")
+                continue
+            
+            if iteration > 20:
+                logger.warning("Too many iterations without tool call")
+                break
+        
+        logger.info(f"\n{'='*80}")
+        logger.info("✅ Quiz solving session completed")
+        logger.info(f"{'='*80}\n")
+    
+    except Exception as e:
+        logger.error(f"Agent error: {e}")
+
+
+# ============================================================================
+# FASTAPI SERVER
+# ============================================================================
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -682,161 +752,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/health")
-def health_check():
+def health():
     """Health check endpoint."""
     return {
         "status": "ok",
-        "model": "gemini-2.0-flash-lite",
+        "model": "gemini-2.0-flash",
         "project": "project2",
-        "timestamp": datetime.now().isoformat()
+        "quota_exhausted": QUOTA_EXHAUSTED
     }
+
 
 @app.get("/")
 def root():
-    """Root endpoint - returns health status."""
-    return health_check()
+    """Root endpoint."""
+    return health()
 
-@app.post("/quiz")
-async def solve_quiz(request: Request):
-    """
-    Main quiz endpoint for Project 2.
-    
-    Expected payload:
-    {
-        "email": "student@example.com",
-        "secret": "your-secret-key",
-        "url": "https://tds-llm-analysis.s-anand.net/project2"
-    }
-    
-    Returns:
-    {
-        "status": "completed|error",
-        "tasks_completed": int,
-        "tasks_correct": int,
-        "success_rate": float,
-        "elapsed_seconds": float
-    }
-    """
-    
-    try:
-        # Parse request
-        try:
-            data = await request.json()
-        except:
-            logger.error("Invalid JSON payload")
-            raise HTTPException(status_code=400, detail="Invalid JSON")
-        
-        # Validate required fields
-        email = data.get("email", "").strip()
-        secret = data.get("secret", "").strip()
-        url = data.get("url", "").strip()
-        
-        if not all([email, secret, url]):
-            logger.warning("Missing required fields")
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required fields: email, secret, url"
-            )
-        
-        # Validate email format
-        if not SecurityValidator.validate_email(email):
-            logger.warning(f"Invalid email format: {email}")
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid email format"
-            )
-        
-        # Validate URL format
-        if not SecurityValidator.validate_url(url):
-            logger.warning(f"Invalid URL format: {url}")
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid URL format"
-            )
-        
-        # Validate secret
-        if not SecurityValidator.validate_secret(secret):
-            logger.warning(f"Invalid secret from {SecurityValidator.mask_sensitive(email)}")
-            raise HTTPException(
-                status_code=403,
-                detail="Invalid secret"
-            )
-        
-        # Run quiz solver
-        solver = QuizSolver(email, secret, url)
-        result = solver.run()
-        
-        logger.info(f"Quiz solving completed: {result['status']}")
-        
-        return result
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error"
-        )
 
 @app.post("/solve-quiz")
-async def solve_quiz_legacy(request: Request):
-    """Legacy endpoint for backward compatibility."""
-    return await solve_quiz(request)
-
-@app.get("/docs-custom")
-def custom_docs():
-    """Custom documentation endpoint."""
-    return {
-        "endpoints": {
-            "POST /quiz": "Main quiz solving endpoint",
-            "POST /solve-quiz": "Legacy endpoint (same as /quiz)",
-            "GET /health": "Health check",
-            "GET /": "Root (returns health status)"
-        },
-        "example_request": {
-            "email": "24f2002642@ds.study.iitm.ac.in",
-            "secret": "your-secret-here",
-            "url": "https://tds-llm-analysis.s-anand.net/project2"
-        },
-        "status_codes": {
-            "200": "Success - quiz solved",
-            "400": "Bad request - invalid JSON or missing fields",
-            "403": "Forbidden - invalid secret",
-            "500": "Server error"
+async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receive quiz URL and start solving.
+    Validates credentials and starts quiz solver in background.
+    """
+    global QUOTA_EXHAUSTED
+    
+    try:
+        data = await request.json()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    
+    email = data.get("email")
+    secret = data.get("secret")
+    quiz_url = data.get("url")
+    
+    if not quiz_url or not secret or not email:
+        raise HTTPException(status_code=400, detail="Missing email, url, or secret")
+    
+    if secret != EXPECTED_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid secret")
+    
+    if QUOTA_EXHAUSTED:
+        raise HTTPException(status_code=503, detail="API quota exhausted - upgrade to paid tier")
+    
+    # Reset state
+    retry_cache.clear()
+    url_time.clear()
+    BASE64_STORE.clear()
+    
+    logger.info(f"✅ Authentication successful. Starting quiz solver for {quiz_url}...")
+    
+    os.environ["url"] = quiz_url
+    os.environ["email"] = email
+    url_time[quiz_url] = time.time()
+    
+    # Run agent in background
+    background_tasks.add_task(run_agent, quiz_url)
+    
+    return JSONResponse(
+        status_code=200,
+        content={
+            "correct": True,
+            "url": quiz_url,
+            "reason": None
         }
-    }
+    )
 
-# ============================================================================
-# STARTUP & SHUTDOWN
-# ============================================================================
 
-@app.on_event("startup")
-async def startup():
-    """Initialize on startup."""
-    logger.info("TDS Project 2 Quiz Solver starting up...")
-    logger.info(f"Google API configured: {bool(GOOGLE_API_KEY)}")
-    logger.info(f"Email configured: {bool(EMAIL)}")
-    logger.info(f"Secret configured: {bool(SECRET)}")
+@app.post("/quiz")
+async def quiz_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """Alternative endpoint for /quiz (same as /solve-quiz)."""
+    return await solve_quiz(request, background_tasks)
 
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup on shutdown."""
-    logger.info("Shutting down...")
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 7860))
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Starting TDS Project 2 Quiz Solver on port {port}")
+    logger.info(f"{'='*80}\n")
     
-    logger.info(f"Starting server on port {port}")
-    
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=port)
