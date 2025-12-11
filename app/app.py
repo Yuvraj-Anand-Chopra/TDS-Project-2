@@ -1,11 +1,12 @@
 """
-AI Quiz Solver - Project 2 Edition (FIXED)
+AI Quiz Solver - Project 2 Edition (OpenAI GPT-4 Mini)
 
 Enhanced FastAPI application for Project 2 with:
+- OpenAI API integration (GPT-4 Mini)
 - Proper quota detection and handling
-- Exponential backoff with API retry_delay extraction
+- Exponential backoff with API delay extraction
 - Better next URL parsing
-- Graceful failure on quota exceeded
+- Graceful failure on API errors
 """
 
 import os
@@ -25,8 +26,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-import google.generativeai as genai
-from bs4 import BeautifulSoup
+from openai import OpenAI, APIError, RateLimitError
 
 # Load environment variables
 load_dotenv()
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 EMAIL = os.getenv("EMAIL", "")
 SECRET = os.getenv("SECRET", "")
 EXPECTED_SECRET = os.getenv("SECRET", "")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # Project 2 specific configuration
 PROJECT_TYPE = "project2"
@@ -57,10 +57,22 @@ DIFFICULTY_LEVELS = {
 BASE64_STORE = {}
 url_time = {}
 retry_cache = {}
-QUOTA_EXHAUSTED = False  # CRITICAL: Track if quota exceeded
+API_ERROR_OCCURRED = False  # Track if API error occurred
 
 RETRY_LIMIT = 4
 TIMEOUT_LIMIT = 300
+
+# ============================================================================
+# OPENAI CLIENT INITIALIZATION
+# ============================================================================
+
+logger.info("Initializing OpenAI API client...")
+try:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    logger.info("✅ OpenAI API client initialized")
+except Exception as e:
+    logger.error(f"❌ OpenAI initialization failed: {e}")
+    client = None
 
 # ============================================================================
 # ERROR HANDLING & CLASSIFICATION
@@ -78,8 +90,7 @@ class ErrorHandler:
         '404': 'not_found',
         'timeout': 'timeout',
         'quota exceeded': 'quota_exceeded',
-        'Resource exhausted': 'quota_exceeded',
-        'limit: 0': 'quota_exceeded',
+        'insufficient_quota': 'quota_exceeded',
         'Connection': 'connection_error',
         'wrong': 'answer_incorrect',
     }
@@ -90,9 +101,7 @@ class ErrorHandler:
         error_str = str(error).lower()
         
         # Check for quota exhaustion FIRST (most critical)
-        if 'limit: 0' in error_str or ('quota exceeded' in error_str and 'limit: 0' in error_str):
-            return 'quota_exceeded'
-        if 'quota exceeded' in error_str and 'daily' in error_str:
+        if 'insufficient_quota' in error_str or ('quota' in error_str and 'exceeded' in error_str):
             return 'quota_exceeded'
             
         for pattern, error_type in ErrorHandler.ERROR_TYPES.items():
@@ -104,11 +113,11 @@ class ErrorHandler:
     
     @staticmethod
     def get_retry_delay(error: Exception) -> Optional[int]:
-        """Extract retry_delay from API error response."""
+        """Extract retry delay from API error response."""
         error_str = str(error)
         
-        # Look for "retry_delay { seconds: XX }"
-        match = re.search(r'seconds:\s*(\d+)', error_str)
+        # Look for "retry-after" or similar patterns
+        match = re.search(r'retry.?after[:\s]+(\d+)', error_str, re.IGNORECASE)
         if match:
             delay = int(match.group(1))
             logger.info(f"API suggests retry after {delay} seconds")
@@ -124,7 +133,7 @@ class ErrorHandler:
                 'retry': False,
                 'action': 'fail_fast',
                 'log': 'critical',
-                'reason': 'Daily quota exhausted - cannot proceed'
+                'reason': 'API quota exhausted - cannot proceed'
             },
             'rate_limit': {
                 'retry': True,
@@ -175,7 +184,7 @@ def rate_limit_aware(max_retries: int = 3):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            global QUOTA_EXHAUSTED
+            global API_ERROR_OCCURRED
             
             wait_time = 1
             
@@ -183,30 +192,43 @@ def rate_limit_aware(max_retries: int = 3):
                 try:
                     return func(*args, **kwargs)
                 
-                except Exception as e:
+                except RateLimitError as e:
+                    # OpenAI rate limit
+                    logger.warning(f"Rate limited on attempt {attempt + 1}. Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    wait_time = min(wait_time * 2, 32)  # Exponential backoff up to 32s
+                    
+                    if attempt < max_retries - 1:
+                        continue
+                    raise
+                
+                except APIError as e:
                     error_type = ErrorHandler.classify_error(e)
                     
                     # CRITICAL: Quota exhausted = permanent failure
                     if error_type == 'quota_exceeded':
-                        QUOTA_EXHAUSTED = True
+                        API_ERROR_OCCURRED = True
                         logger.error("⚠️  QUOTA EXHAUSTED - Cannot proceed")
                         logger.error(f"   Reason: {str(e)[:200]}")
                         raise
                     
-                    # Rate limit = temporary, apply backoff
-                    if error_type == 'rate_limit':
-                        # Check if API suggests retry delay
-                        api_delay = ErrorHandler.get_retry_delay(e)
-                        if api_delay:
-                            wait_time = api_delay
-                        
-                        logger.warning(f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
-                        time.sleep(wait_time)
-                        wait_time = min(wait_time * 2, 32)  # Exponential backoff up to 32s
-                        
-                        if attempt < max_retries - 1:
-                            continue
+                    # Other API errors
+                    if error_type in ['auth']:
+                        API_ERROR_OCCURRED = True
+                        raise
                     
+                    # Other errors might be retryable
+                    logger.error(f"API error ({error_type}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
+                    raise
+                
+                except Exception as e:
+                    logger.error(f"Unexpected error: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(wait_time)
+                        continue
                     raise
         
         return wrapper
@@ -275,7 +297,7 @@ class ContentAnalyzer:
 
 def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
     """
-    Parse Gemini's tool calls from response text.
+    Parse OpenAI's tool calls from response text.
     IMPROVED: Better boundary detection and parameter extraction.
     """
     if "```" not in response_text:
@@ -330,7 +352,7 @@ def parse_tool_call(response_text: str) -> Tuple[Optional[str], Optional[dict]]:
 
 def extract_next_url(response_text: str, current_url: str) -> Optional[str]:
     """
-    IMPROVED: Extract next URL from Gemini response with better pattern matching.
+    IMPROVED: Extract next URL from OpenAI response with better pattern matching.
     Tries multiple extraction strategies.
     """
     
@@ -543,49 +565,44 @@ def execute_tool(tool_name: str, params: dict) -> str:
 
 
 # ============================================================================
-# GEMINI MODEL INITIALIZATION
+# OPENAI INTEGRATION WITH RATE LIMIT HANDLING
 # ============================================================================
 
-logger.info("Initializing Gemini API...")
-try:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel("gemini-2.0-flash-lite")
-    logger.info("✅ Gemini 2.0 Flash Lite initialized")
-except Exception as e:
-    logger.warning(f"Gemini 2.0 Flash failed: {e}")
+@rate_limit_aware(max_retries=3)
+def ask_openai_with_rate_limit(messages: list) -> str:
+    """Ask OpenAI GPT-4 Mini with built-in rate limit handling."""
+    global API_ERROR_OCCURRED
+    
+    if API_ERROR_OCCURRED:
+        raise RuntimeError("API error occurred - cannot call OpenAI API")
+    
+    if not client:
+        raise RuntimeError("OpenAI client not initialized")
+    
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        logger.info("✅ Gemini 1.5 Flash initialized (fallback)")
-    except Exception as e2:
-        logger.error(f"❌ Model initialization failed: {e2}")
-        model = None
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.7,
+            max_tokens=2000
+        )
+        return response.choices[0].message.content if response else ""
+    
+    except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
+        raise
 
 
 # ============================================================================
 # AUTONOMOUS QUIZ SOLVER AGENT
 # ============================================================================
 
-@rate_limit_aware(max_retries=3)
-def ask_gemini_with_rate_limit(messages: list) -> str:
-    """Ask Gemini a question with built-in rate limit handling."""
-    global QUOTA_EXHAUSTED
-    
-    if QUOTA_EXHAUSTED:
-        raise RuntimeError("Quota exhausted - cannot call Gemini API")
-    
-    if not model:
-        raise RuntimeError("Gemini model not initialized")
-    
-    response = model.generate_content(messages, stream=False)
-    return response.text if response else ""
-
-
 def run_agent(url: str):
     """
     Main agent loop for solving Project 2 quiz questions.
-    IMPROVED: Detects quota exhaustion and fails fast.
+    IMPROVED: Detects API errors and fails fast.
     """
-    global QUOTA_EXHAUSTED
+    global API_ERROR_OCCURRED
     
     logger.info(f"\n{'='*80}")
     logger.info(f"Starting Project 2 quiz solver for: {url}")
@@ -598,7 +615,7 @@ def run_agent(url: str):
     task_attempts = {}
     
     SYSTEM_PROMPT = (
-        "You are an expert PROJECT 2 SOLVER.\n\n"
+        "You are an expert PROJECT 2 QUIZ SOLVER.\n\n"
         "CRITICAL RULES:\n"
         "1. Difficulty 1-2: Next URL always shown (even if wrong)\n"
         "2. Difficulty 3-5: Next URL ONLY if answer is CORRECT\n"
@@ -606,26 +623,26 @@ def run_agent(url: str):
         "4. Check if task is personalized or not\n"
         "5. Solve correctly on difficulties 3-5 or you get stuck\n\n"
         "WORKFLOW:\n"
-        "1. Call get_rendered_html to fetch the task page\n"
+        "1. Use get_rendered_html to fetch the task page\n"
         "2. READ the task carefully\n"
         "3. Identify: difficulty, format requirement, personalization\n"
         "4. Solve the problem CORRECTLY\n"
         "5. Format answer exactly as required\n"
-        "6. POST to https://tds-llm-analysis.s-anand.net/submit\n"
+        "6. Use post_request to submit to https://tds-llm-analysis.s-anand.net/submit\n"
         "7. Continue until all tasks completed\n\n"
         f"YOUR CREDENTIALS:\n"
         f"Email: {EMAIL}\n"
         f"Secret: {SECRET}\n"
         f"Submit to: {SUBMIT_URL}\n\n"
-        "Available tools: get_rendered_html, post_request, run_code"
+        "Available tools: get_rendered_html, post_request, run_code, download_file"
     )
     
     try:
         while iteration < max_iterations:
             iteration += 1
             
-            if QUOTA_EXHAUSTED:
-                logger.error("⚠️  QUOTA EXHAUSTED - Stopping agent")
+            if API_ERROR_OCCURRED:
+                logger.error("⚠️  API ERROR - Stopping agent")
                 break
             
             logger.info(f"\n{'='*80}")
@@ -656,22 +673,25 @@ def run_agent(url: str):
             
             message_history.append({"role": "user", "content": prompt})
             
-            logger.info("Calling Gemini...\n")
+            logger.info("Calling OpenAI GPT-4 Mini...\n")
             
             try:
-                text = ask_gemini_with_rate_limit(
-                    [{"role": msg["role"], "parts": [msg["content"]]} for msg in message_history]
-                )
+                text = ask_openai_with_rate_limit(message_history)
             
             except Exception as e:
                 error_type = ErrorHandler.classify_error(e)
                 
                 if error_type == 'quota_exceeded':
-                    QUOTA_EXHAUSTED = True
-                    logger.error(f"⚠️  QUOTA EXHAUSTED: {str(e)[:200]}")
+                    API_ERROR_OCCURRED = True
+                    logger.error(f"⚠️  API QUOTA EXCEEDED: {str(e)[:200]}")
                     break
                 
-                logger.error(f"Gemini error ({error_type}): {e}")
+                if error_type in ['auth']:
+                    API_ERROR_OCCURRED = True
+                    logger.error(f"⚠️  API AUTH ERROR: {str(e)[:200]}")
+                    break
+                
+                logger.error(f"OpenAI error ({error_type}): {e}")
                 message_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
                 continue
             
@@ -679,7 +699,7 @@ def run_agent(url: str):
                 logger.warning("No response from model")
                 continue
             
-            logger.info(f"Gemini response ({len(text)} chars):\n{text[:600]}\n")
+            logger.info(f"OpenAI response ({len(text)} chars):\n{text[:600]}\n")
             
             # Parse tool call
             tool_name, params = parse_tool_call(text)
@@ -709,7 +729,7 @@ def run_agent(url: str):
             
             # Check for completion
             if "END" in text or "complete" in text.lower() or "all tasks" in text.lower():
-                logger.info("✅ Quiz marked complete by Gemini")
+                logger.info("✅ Quiz marked complete by OpenAI")
                 break
             
             # Track attempts
@@ -758,9 +778,9 @@ def health():
     """Health check endpoint."""
     return {
         "status": "ok",
-        "model": "gemini-2.0-flash",
+        "model": "gpt-4o-mini",
         "project": "project2",
-        "quota_exhausted": QUOTA_EXHAUSTED
+        "api_error": API_ERROR_OCCURRED
     }
 
 
@@ -776,7 +796,7 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
     Receive quiz URL and start solving.
     Validates credentials and starts quiz solver in background.
     """
-    global QUOTA_EXHAUSTED
+    global API_ERROR_OCCURRED
     
     try:
         data = await request.json()
@@ -793,8 +813,11 @@ async def solve_quiz(request: Request, background_tasks: BackgroundTasks):
     if secret != EXPECTED_SECRET:
         raise HTTPException(status_code=403, detail="Invalid secret")
     
-    if QUOTA_EXHAUSTED:
-        raise HTTPException(status_code=503, detail="API quota exhausted - upgrade to paid tier")
+    if API_ERROR_OCCURRED:
+        raise HTTPException(status_code=503, detail="API error occurred - check logs")
+    
+    if not client:
+        raise HTTPException(status_code=503, detail="OpenAI API client not initialized")
     
     # Reset state
     retry_cache.clear()
@@ -830,6 +853,7 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 7860))
     logger.info(f"\n{'='*80}")
     logger.info(f"Starting TDS Project 2 Quiz Solver on port {port}")
+    logger.info(f"Using: OpenAI GPT-4 Mini")
     logger.info(f"{'='*80}\n")
     
     uvicorn.run(app, host="0.0.0.0", port=port)
